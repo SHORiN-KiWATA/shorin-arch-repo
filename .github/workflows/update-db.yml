@@ -159,6 +159,34 @@ jobs:
             fi
           done < /work/r2-packages.txt
 
+          # --- Check 3: Orphaned db entries (in db but not on R2) ---
+          > /work/orphan-names.txt
+          declare -A R2_PKG_NAMES
+          while read -r pkgfile; do
+            [ -z "$pkgfile" ] && continue
+            base="${pkgfile%.pkg.tar.zst}"
+            arch="${base##*-}"
+            base="${base%-*}"
+            rel="${base##*-}"
+            base="${base%-*}"
+            pkgver="${base##*-}"
+            pkgname="${base%-*}"
+            R2_PKG_NAMES["$pkgname"]=1
+          done < /work/r2-packages.txt
+
+          while read -r db_name db_ver; do
+            [ -z "$db_name" ] && continue
+            if [ -z "${R2_PKG_NAMES[$db_name]}" ]; then
+              echo "ORPHAN DB ENTRY: $db_name (in db but not on R2)"
+              echo "$db_name" >> /work/orphan-names.txt
+              NEED_UPDATE=true
+              REASON="$REASON; orphaned db entry $db_name"
+            fi
+          done < /work/db-entries.txt
+
+          ORPHAN_COUNT=$(wc -l < /work/orphan-names.txt 2>/dev/null || echo 0)
+          echo "Orphaned db entries: $ORPHAN_COUNT"
+
           CHANGED_COUNT=$(wc -l < /work/changed-packages.txt)
           echo "Changed packages: $CHANGED_COUNT"
           echo "Need update: $NEED_UPDATE"
@@ -205,6 +233,13 @@ jobs:
         run: |
           cd /work
           rm -f *.old
+
+          # Remove orphaned db entries first
+          if [ -f /work/orphan-names.txt ] && [ -s /work/orphan-names.txt ]; then
+            ORPHAN_NAMES=$(cat /work/orphan-names.txt | tr '\n' ' ')
+            echo "Removing orphaned db entries: $ORPHAN_NAMES"
+            repo-remove shorin-arch.db.tar.zst $ORPHAN_NAMES
+          fi
 
           # If no changed packages but sig was bad, we still need to re-sign
           # In that case there are no packages to repo-add, just re-sign existing db

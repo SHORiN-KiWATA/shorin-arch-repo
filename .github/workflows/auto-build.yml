@@ -315,6 +315,45 @@ jobs:
 
           done < /work/aur-versions.txt
 
+          # === Cleanup orphaned packages (in db but not in pkglist) ===
+          echo ""
+          echo "=== Checking for orphaned packages ==="
+
+          PKGLIST_NAMES=$(grep -v '^#' pkglist | grep -v '^$' | sort -u)
+
+          if [ -f /work/shorin-arch.db.tar.zst ]; then
+            ORPHAN_COUNT=0
+            while IFS=' ' read -r db_name db_file; do
+              [ -z "$db_name" ] && continue
+              if ! echo "$PKGLIST_NAMES" | grep -qx "$db_name"; then
+                echo "  ORPHAN: $db_name ($db_file)"
+                aws s3 rm "${R2_PREFIX}${db_file}" ${ENDPOINT} 2>/dev/null || true
+                aws s3 rm "${R2_PREFIX}${db_file}.sig" ${ENDPOINT} 2>/dev/null || true
+                ORPHAN_COUNT=$((ORPHAN_COUNT + 1))
+              fi
+            done < <(
+              tar -xOf /work/shorin-arch.db.tar.zst --wildcards '*/desc' 2>/dev/null \
+              | awk '
+                  /^%NAME%/     { getline name; next }
+                  /^%FILENAME%/ { getline fname; next }
+                  /^$/          {
+                      if (name != "" && fname != "") {
+                          print name " " fname
+                          name=""; fname=""
+                      }
+                      next
+                  }
+                  END {
+                      if (name != "" && fname != "")
+                          print name " " fname
+                  }
+                '
+            )
+            echo "Orphaned packages removed: $ORPHAN_COUNT"
+          else
+            echo "No existing db, skipping orphan check"
+          fi
+
           echo ""
           echo "=== Build Results ==="
           cat /work/build-results.txt
@@ -336,4 +375,14 @@ jobs:
             done < /work/build-results.txt
           else
             echo "**All packages up to date.**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check for failures
+        if: always()
+        shell: bash
+        run: |
+          if [ -f /work/build-results.txt ] && grep -q "^FAILED" /work/build-results.txt; then
+            echo "::error::Some packages failed to build"
+            grep "^FAILED" /work/build-results.txt
+            exit 1
           fi

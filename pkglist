@@ -20,4 +20,14 @@ waypaper
 wl-longshot-git
 pins-git
 gearlever
+# === nvidia drivers ===
+nvidia-580xx-settings
+nvidia-580xx-utils
+nvidia-580xx-dkms
+opencl-nvidia-580xx
+nvidia-470xx-settings
+nvidia-470xx-utils
+nvidia-470xx-dkms
+opencl-nvidia-470xx
+
 
