@@ -99,6 +99,8 @@ jobs:
       - name: Detect packages needing rebuild
         shell: bash
         run: |
+          set +e
+
           # Build db version lookup
           declare -A DB_VER
           while read -r name ver; do
@@ -126,7 +128,6 @@ jobs:
               mkdir -p /work/check
               chown -R builder:builder /work/check
 
-              # Clone as builder so makepkg has write permission
               if ! sudo -u builder git clone --quiet "https://aur.archlinux.org/${aur_base}.git" "$check_dir" 2>/dev/null; then
                 echo "  ERROR: Failed to clone AUR repo for $aur_name, skipping"
                 continue
@@ -134,81 +135,67 @@ jobs:
 
               cd "$check_dir"
 
-              # makepkg -od: download sources only, no build.
-              # --nodeps: skip makedepends check (we only need sources for pkgver)
-              # -C: clean leftover build artifacts first
-              makepkg_od_output=$(sudo -u builder makepkg -od --noconfirm --nodeps -C 2>&1)
-              makepkg_od_rc=$?
+              # makepkg -o: download sources only (nobuild), -d: skip deps
+              sudo -u builder makepkg -o -d --noconfirm -C > /tmp/makepkg-o.log 2>&1
+              mp_rc=$?
 
-              if [ $makepkg_od_rc -ne 0 ]; then
-                echo "  makepkg -od output:"
-                echo "$makepkg_od_output"
-                echo "  ERROR: makepkg -od failed for $aur_name"
-                echo "  Will attempt full build to check (makepkg -s will get actual version)"
-                # If makepkg -od fails, we can't compute pkgver without building.
-                # Mark for rebuild - the build step will run makepkg -s which
-                # computes pkgver internally. If the resulting package version
-                # is not newer, it just wastes a build but won't break anything.
+              if [ $mp_rc -ne 0 ]; then
+                echo "  makepkg -o failed (rc=$mp_rc):"
+                tail -5 /tmp/makepkg-o.log | sed 's/^/    /'
+                echo "  Marking for full build to check"
                 echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
                 cd /work
                 rm -rf "$check_dir"
                 continue
               fi
 
-              # Get srcdir (makepkg uses $startdir/src by default)
               srcdir="${check_dir}/src"
 
-              # Source PKGBUILD and run pkgver() in the srcdir context
-              # We need to pass srcdir and startdir as environment variables
+              # Run pkgver() with proper env
               computed_ver=$(sudo -u builder \
                 srcdir="$srcdir" \
                 startdir="$check_dir" \
                 bash -c '
-                  set +e
                   source PKGBUILD 2>/dev/null
                   cd "$srcdir" 2>/dev/null
                   pkgver 2>/dev/null
                 ' 2>/dev/null)
 
               if [ -z "$computed_ver" ]; then
-                echo "  pkgver() in srcdir failed, trying in startdir..."
+                echo "  pkgver() failed, trying in startdir..."
                 computed_ver=$(sudo -u builder \
                   srcdir="$srcdir" \
                   startdir="$check_dir" \
                   bash -c '
-                    set +e
                     source PKGBUILD 2>/dev/null
                     pkgver 2>/dev/null
                   ' 2>/dev/null)
               fi
 
               if [ -z "$computed_ver" ]; then
-                echo "  ERROR: Could not compute pkgver for $aur_name"
-                echo "  Will attempt full build to check"
+                echo "  Could not compute pkgver, marking for full build"
                 echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
                 cd /work
                 rm -rf "$check_dir"
                 continue
               fi
 
-              # Get pkgrel
               pkgrel=$(bash -c 'source PKGBUILD 2>/dev/null; echo "$pkgrel"' 2>/dev/null)
               [ -z "$pkgrel" ] && pkgrel="1"
 
               full_ver="${computed_ver}-${pkgrel}"
-              echo "  Computed version: $full_ver (DB: $db_ver)"
+              echo "  Computed: $full_ver (DB: $db_ver)"
 
               if [ "$(vercmp "$full_ver" "$db_ver")" -gt 0 ]; then
-                echo "  NEEDS REBUILD: $aur_name $db_ver -> $full_ver"
+                echo "  NEEDS REBUILD"
                 echo "$aur_name $aur_base $full_ver" >> /work/rebuild-list.txt
               else
-                echo "  UP TO DATE: $aur_name"
+                echo "  UP TO DATE"
               fi
 
               cd /work
               rm -rf "$check_dir"
             else
-              # Non-git package: use RPC version directly
               if [ "$(vercmp "$aur_ver" "$db_ver")" -gt 0 ]; then
                 echo "UPDATE: $aur_name $db_ver -> $aur_ver"
                 echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
