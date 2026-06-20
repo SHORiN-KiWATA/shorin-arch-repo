@@ -22,10 +22,8 @@ jobs:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
-          echo "pinentry-mode loopback" > ~/.gnupg/gpg-agent.conf
-          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          echo "allow-loopback-pinentry" > ~/.gnupg/gpg-agent.conf
           gpgconf --kill gpg-agent 2>/dev/null || true
-          gpgconf --launch gpg-agent 2>/dev/null || true
 
       - name: Download existing database
         env:

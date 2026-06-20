@@ -46,15 +46,8 @@ jobs:
           mkdir -p "$GNUPGHOME"
           chmod 700 "$GNUPGHOME"
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
-          echo "pinentry-mode loopback" > "$GNUPGHOME/gpg-agent.conf"
-          echo "allow-loopback-pinentry" >> "$GNUPGHOME/gpg-agent.conf"
-          # Kill any existing agent and prevent auto-start issues
+          echo "allow-loopback-pinentry" > "$GNUPGHOME/gpg-agent.conf"
           gpgconf --kill gpg-agent 2>/dev/null || true
-          # Test signing works
-          echo "test" | gpg --batch --yes --pinentry-mode loopback \
-            --passphrase "$GPG_PASSPHRASE" --detach-sign --no-armor 2>/dev/null \
-            && echo "GPG signing test OK" \
-            || echo "GPG signing test FAILED"
 
       - name: Download R2 database and parse versions
         shell: bash
