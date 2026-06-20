@@ -279,17 +279,7 @@ jobs:
 
               echo "  Built and signed: $pkgfile (version: $BUILT_VER)"
 
-              # Remove old versions on R2
-              for R2_OBJ in $(aws s3 ls ${R2_PREFIX} ${ENDPOINT} | awk '{print $4}' | grep "\.pkg\.tar\.zst$"); do
-                [ "$R2_OBJ" = "$pkgfile" ] && continue
-                R2_BASE=$(echo "$R2_OBJ" | sed -E 's/-[^-]+-[^-]+-[^-]+\.pkg\.tar\.zst$//')
-                [ "$R2_BASE" = "$BASE_NAME" ] || continue
-                echo "  Removing old: $R2_OBJ"
-                aws s3 rm "${R2_PREFIX}${R2_OBJ}" ${ENDPOINT}
-                aws s3 rm "${R2_PREFIX}${R2_OBJ}.sig" ${ENDPOINT} 2>/dev/null || true
-              done
-
-              # Upload new package + sig
+              # Upload new package + sig (old versions cleaned up by update-db)
               aws s3 cp "/release/${pkgfile}" "${R2_PREFIX}${pkgfile}" ${ENDPOINT}
               aws s3 cp "/release/${pkgfile}.sig" "${R2_PREFIX}${pkgfile}.sig" ${ENDPOINT}
 
