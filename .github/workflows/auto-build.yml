@@ -309,8 +309,8 @@ jobs:
               echo "  Built and signed: $pkgfile (version: $BUILT_VER)"
 
               # Upload new package + sig (old versions cleaned up by update-db)
-              aws s3 cp "/release/${pkgfile}" "${R2_PREFIX}${pkgfile}" ${ENDPOINT}
-              aws s3 cp "/release/${pkgfile}.sig" "${R2_PREFIX}${pkgfile}.sig" ${ENDPOINT}
+              aws s3 cp "/release/${pkgfile}" "${R2_PREFIX}${pkgfile}" ${ENDPOINT} --cache-control 'max-age=0'
+              aws s3 cp "/release/${pkgfile}.sig" "${R2_PREFIX}${pkgfile}.sig" ${ENDPOINT} --cache-control 'max-age=0'
 
               echo "  Uploaded: $pkgfile + sig"
               echo "OK $built_pkgname ($pkgfile)" >> /work/build-results.txt

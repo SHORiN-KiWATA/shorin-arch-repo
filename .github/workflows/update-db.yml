@@ -412,7 +412,7 @@ jobs:
             shorin-arch.files.sig; do
             if [ -f "$f" ]; then
               echo "Uploading: $f"
-              aws s3 cp "$f" "${BUCKET}/${f}" ${ENDPOINT}
+              aws s3 cp "$f" "${BUCKET}/${f}" ${ENDPOINT} --cache-control 'max-age=0'
             fi
           done
 
