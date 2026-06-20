@@ -2,7 +2,6 @@ chwd-arch-git
 cliphist-tui-git
 ddcutil-service
 dsearch-bin
-fuzzel-ime-git
 kwin-effects-geometry-change
 linuxqq-clipsync-git
 niri-sidebar-git
@@ -19,7 +18,16 @@ ttf-lxgw-wenkai-screen
 waypaper
 wl-longshot-git
 pins-git
+lsfg-vk-bin
+mangojuice
+video-downloader
+
+# === gearlever ===
 gearlever
+dwarfs-bin
+python-ftputil
+python-desktop-entry-lib
+
 # === nvidia drivers ===
 nvidia-580xx-settings
 nvidia-580xx-utils
@@ -29,8 +37,4 @@ nvidia-470xx-settings
 nvidia-470xx-utils
 nvidia-470xx-dkms
 opencl-nvidia-470xx
-# === AUR runtime dependencies (not in official repos, hard to download in China) ===
-dwarfs-bin
-lsfg-vk-bin
-mangojuice
-video-downloader
+
