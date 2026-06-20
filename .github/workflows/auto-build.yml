@@ -135,8 +135,10 @@ jobs:
 
               cd "$check_dir"
 
-              # makepkg -o: download sources only (nobuild), -d: skip deps
-              sudo -u builder makepkg -o -d --noconfirm -C > /tmp/makepkg-o.log 2>&1
+              # makepkg -o: download sources only (nobuild)
+              # -s: install makedepends automatically (needed for prepare() 
+              #     which may call cargo/rustc/etc)
+              sudo -u builder makepkg -o -s --noconfirm --needed -C > /tmp/makepkg-o.log 2>&1
               mp_rc=$?
 
               if [ $mp_rc -ne 0 ]; then
