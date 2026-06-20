@@ -151,53 +151,40 @@ jobs:
               echo "  NEW (not in db)"
             fi
 
-            pkg_dir="/work/build/${aur_name}"
-            rm -rf "$pkg_dir"
-            mkdir -p /work/build
-            chown -R builder:builder /work/build
-
-            # Clone AUR repo (yay -G downloads to CWD, not --builddir)
-            cd /work/build
-            if ! sudo -u builder yay -G -a "$aur_base" 2>&1; then
-              echo "  FAILED: Could not clone $aur_base"
-              echo "FAILED $aur_name (clone error)" >> /work/build-results.txt
-              cd /work
-              continue
-            fi
-
-            # yay -G creates a subdirectory named after PackageBase
-            actual_dir="/work/build/${aur_base}"
-            if [ ! -d "$actual_dir" ]; then
-              # Try aur_name if different from aur_base
-              actual_dir=$(find /work/build -maxdepth 1 -type d | tail -1)
-            fi
-
-            cd "$actual_dir"
-
             if [[ "$aur_name" == *-git ]]; then
-              # For -git packages: run makepkg -o to get actual version from pkgver()
-              # yay -B with --mflags "-o" does: install deps + makepkg -o (nobuild)
+              # === -git package: clone + makepkg -o to compute actual version ===
+              mkdir -p /work/build
+              chown -R builder:builder /work/build
+
+              cd /work/build
+              if ! sudo -u builder yay -G -a "$aur_base" 2>&1; then
+                echo "  FAILED: Could not clone $aur_base"
+                echo "FAILED $aur_name (clone error)" >> /work/build-results.txt
+                cd /work
+                continue
+              fi
+
+              actual_dir="/work/build/${aur_base}"
+              if [ ! -d "$actual_dir" ]; then
+                actual_dir=$(find /work/build -maxdepth 1 -type d | tail -1)
+              fi
+
+              cd "$actual_dir"
+
               echo "  Checking version via makepkg -o..."
               sudo -u builder yay -B "$actual_dir" --noconfirm --mflags "-o" --answerclean All --answerdiff None 2>&1 | tail -5
 
-              # Get computed version from packagelist
               pkglist_output=$(sudo -u builder makepkg --packagelist 2>/dev/null)
               first_pkg=$(echo "$pkglist_output" | head -1)
 
               if [ -z "$first_pkg" ]; then
                 echo "  ERROR: Could not get package list, marking for full build"
-                computed_ver=""
+                full_ver=""
               else
-                # Extract version from filename: <name>-<ver>-<rel>-<arch>.pkg.tar.zst
                 base_name=$(basename "$first_pkg" .pkg.tar.zst)
-                # Strip arch (last dash field)
                 tmp="${base_name%-*}"
-                # Strip rel (second to last dash field)
                 tmp="${tmp%-*}"
-                # Now tmp = <name>-<version>, version is after last dash
                 computed_ver="${tmp##*-}"
-
-                # Get pkgrel
                 pkgrel=$(bash -c 'source PKGBUILD 2>/dev/null; echo "$pkgrel"' 2>/dev/null)
                 [ -z "$pkgrel" ] && pkgrel="1"
                 full_ver="${computed_ver}-${pkgrel}"
@@ -215,15 +202,32 @@ jobs:
                 echo "  NEEDS REBUILD"
               fi
             else
-              # Non-git package: use RPC version directly
+              # === Non-git package: use RPC version directly, no clone needed ===
               if [ -n "$db_ver" ] && [ "$(vercmp "$aur_ver" "$db_ver")" -le 0 ]; then
                 echo "  UP TO DATE: $aur_name"
-                cd /work
-                rm -rf "$actual_dir"
                 echo "SKIPPED $aur_name (up to date: $aur_ver)" >> /work/build-results.txt
                 continue
               fi
               echo "  NEEDS REBUILD: $aur_name $db_ver -> $aur_ver"
+
+              # Clone only when rebuild is needed
+              mkdir -p /work/build
+              chown -R builder:builder /work/build
+
+              cd /work/build
+              if ! sudo -u builder yay -G -a "$aur_base" 2>&1; then
+                echo "  FAILED: Could not clone $aur_base"
+                echo "FAILED $aur_name (clone error)" >> /work/build-results.txt
+                cd /work
+                continue
+              fi
+
+              actual_dir="/work/build/${aur_base}"
+              if [ ! -d "$actual_dir" ]; then
+                actual_dir=$(find /work/build -maxdepth 1 -type d | tail -1)
+              fi
+
+              cd "$actual_dir"
             fi
 
             # === Build phase (reuse same directory) ===
