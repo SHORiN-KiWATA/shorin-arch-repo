@@ -226,39 +226,6 @@ jobs:
               cd "$actual_dir"
             fi
 
-            # === Resolve AUR dependencies (not as packages in our repo) ===
-            echo "  Resolving dependencies..."
-            cd "$actual_dir"
-
-            # Extract all dependency arrays from PKGBUILD
-            ALL_DEPS=$(bash -c '
-              source PKGBUILD 2>/dev/null
-              for arr in depends makedepends checkdepends; do
-                eval "vals=(\"\${${arr}[@]}\")"
-                for v in "${vals[@]}"; do
-                  # Strip version constraints like >=1.0
-                  echo "$v" | sed "s/[<>=].*//"
-                done
-              done
-            ' 2>/dev/null | sort -u)
-
-            # Try pacman first, then yay for AUR-only deps
-            for dep in $ALL_DEPS; do
-              if pacman -Qi "$dep" >/dev/null 2>&1; then
-                continue
-              fi
-              # Also check if any installed package provides this dependency
-              if pacman -Qi 2>/dev/null | awk '/^%PROVIDES%/{getline;n=split($0,a," ");for(i=1;i<=n;i++)print a[i]}' | grep -qx "$dep"; then
-                continue
-              fi
-              if pacman -Si "$dep" >/dev/null 2>&1; then
-                sudo -u builder sudo pacman -S --noconfirm --asdeps "$dep" >/dev/null 2>&1
-              else
-                echo "  Installing AUR dependency: $dep"
-                sudo -u builder yay -S --noconfirm --asdeps --answerclean All --answerdiff None "$dep" 2>&1 | tail -3
-              fi
-            done
-
             # === Build phase (reuse same directory) ===
             echo "  Building..."
             if ! sudo -u builder yay -B "$actual_dir" --noconfirm --mflags "--skippgpcheck" --answerclean All --answerdiff None 2>&1 | tail -10; then
@@ -319,6 +286,9 @@ jobs:
 
             cd /work
             rm -rf "$actual_dir"
+
+            # Clean up build dependencies to avoid conflicts between packages
+            sudo pacman -Rns $(pacman -Qdtq) 2>/dev/null || true
 
           done < /work/aur-versions.txt
 
