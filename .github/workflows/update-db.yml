@@ -1,0 +1,233 @@
+name: Update Repository Database
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+jobs:
+  update-db:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - name: Prepare environment
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm aws-cli sudo
+
+      - name: Configure GPG
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          echo "pinentry-mode loopback" > ~/.gnupg/gpg-agent.conf
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+
+      - name: Download existing database
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          mkdir -p /work /tmp/newpkgs
+          cd /work
+          ENDPOINT="--endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          BUCKET="s3://shorin-arch-repo/archlinux/x86_64"
+
+          aws s3 cp ${BUCKET}/shorin-arch.db.tar.zst ./shorin-arch.db.tar.zst ${ENDPOINT} \
+            || echo "WARN: No existing db, will create new one"
+          aws s3 cp ${BUCKET}/shorin-arch.files.tar.zst ./shorin-arch.files.tar.zst ${ENDPOINT} \
+            || echo "WARN: No existing files db, will create new one"
+
+      - name: List packages on R2
+        id: list-r2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          ENDPOINT="--endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          BUCKET="s3://shorin-arch-repo/archlinux/x86_64"
+
+          # List all .pkg.tar.zst on R2 (filename only, strip directory prefix)
+          aws s3 ls ${BUCKET}/ ${ENDPOINT} --recursive \
+            | awk '{print $4}' \
+            | grep -E '\.pkg\.tar\.zst$' \
+            | xargs -n1 basename \
+            | sort -u > /work/r2-packages.txt
+
+          echo "Found $(wc -l < /work/r2-packages.txt) packages on R2"
+
+      - name: Parse existing database entries
+        run: |
+          cd /work
+          DB="shorin-arch.db.tar.zst"
+
+          if [ ! -f "$DB" ]; then
+            echo "No existing database, all packages are new"
+            : > /work/db-entries.txt
+            exit 0
+          fi
+
+          # Extract all desc files from the database and parse %NAME%/%VERSION% pairs
+          # Format inside desc: %NAME%\n<name>\n...\n%VERSION%\n<version>\n...
+          tar -xOf "$DB" --wildcards '*/desc' 2>/dev/null \
+            | awk '
+                /^%NAME%/    { getline name; next }
+                /^%VERSION%/ { getline ver; next }
+                /^$/         {
+                    if (name != "" && ver != "") {
+                        print name " " ver
+                        name=""; ver=""
+                    }
+                    next
+                }
+                END {
+                    if (name != "" && ver != "")
+                        print name " " ver
+                }
+              ' \
+            | sort -u > /work/db-entries.txt
+
+          echo "Database has $(wc -l < /work/db-entries.txt) entries:"
+          cat /work/db-entries.txt
+
+      - name: Compute changed packages
+        id: diff
+        run: |
+          cd /work
+
+          # Build a lookup of db entries: name -> version
+          declare -A DB_VER
+          while read -r name ver; do
+            [ -n "$name" ] && DB_VER["$name"]="$ver"
+          done < /work/db-entries.txt
+
+          # For each R2 package, extract base name and version, compare with db
+          > /work/changed-packages.txt
+
+          while read -r pkgfile; do
+            [ -z "$pkgfile" ] && continue
+
+            # Extract base name and version from filename:
+            # <name>-<version>-<rel>-<arch>.pkg.tar.zst
+            # We need the LAST three dash-separated fields as rel, arch, suffix
+            # and everything before is name-version. But name can contain dashes.
+            # Strategy: strip known suffix, then split off last two dash fields (rel, arch)
+            # The remaining is <name>-<version>, split at the LAST dash.
+            base="${pkgfile%.pkg.tar.zst}"
+
+            arch="${base##*-}"
+            base="${base%-*}"          # strip arch
+            rel="${base##*-}"
+            base="${base%-*}"          # strip rel
+            # Now base = <name>-<version>
+            pkgver="${base##*-}"       # version is after last dash
+            pkgname="${base%-*}"       # name is before last dash
+
+            db_ver="${DB_VER[$pkgname]:-}"
+
+            if [ -z "$db_ver" ]; then
+              echo "NEW: $pkgname $pkgver ($pkgfile)"
+              echo "$pkgfile" >> /work/changed-packages.txt
+            else
+              # Compare versions using vercmp
+              if [ "$(vercmp "$pkgver" "$db_ver")" -gt 0 ]; then
+                echo "UPDATE: $pkgname $db_ver -> $pkgver ($pkgfile)"
+                echo "$pkgfile" >> /work/changed-packages.txt
+              fi
+            fi
+          done < /work/r2-packages.txt
+
+          CHANGED_COUNT=$(wc -l < /work/changed-packages.txt)
+          echo "Changed packages: $CHANGED_COUNT"
+
+          if [ "$CHANGED_COUNT" -eq 0 ]; then
+            echo "No changes detected, database is up to date."
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download changed packages
+        if: steps.diff.outputs.has_changes == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          cd /work
+          ENDPOINT="--endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          BUCKET="s3://shorin-arch-repo/archlinux/x86_64"
+
+          while read -r pkgfile; do
+            [ -z "$pkgfile" ] && continue
+            echo "Downloading: $pkgfile"
+            aws s3 cp "${BUCKET}/${pkgfile}" "/tmp/newpkgs/${pkgfile}" ${ENDPOINT}
+          done < /work/changed-packages.txt
+
+          echo "Downloaded $(ls /tmp/newpkgs/*.pkg.tar.zst 2>/dev/null | wc -l) packages"
+
+      - name: Update database with repo-add
+        if: steps.diff.outputs.has_changes == 'true'
+        run: |
+          cd /work
+
+          # Remove repo-add backup files if any
+          rm -f *.old
+
+          # repo-add updates both .db.tar.zst and .files.tar.zst
+          # --sign signs the database files, --key specifies the GPG key
+          repo-add --sign --key 8ED9ABE61CDBAABAC4B6A694C9218E60C13B4BA8 \
+            shorin-arch.db.tar.zst /tmp/newpkgs/*.pkg.tar.zst
+
+          # repo-add creates symlinks: shorin-arch.db -> shorin-arch.db.tar.zst
+          # and shorin-arch.files -> shorin-arch.files.tar.zst
+          # Replace symlinks with real copies so aws s3 cp uploads them properly
+          for f in shorin-arch.db shorin-arch.files; do
+            if [ -L "$f" ]; then
+              target=$(readlink -f "$f")
+              rm -f "$f"
+              cp "$target" "$f"
+            fi
+          done
+
+          # Same for .sig symlinks
+          for f in shorin-arch.db.sig shorin-arch.files.sig; do
+            if [ -L "$f" ]; then
+              target=$(readlink -f "$f")
+              rm -f "$f"
+              cp "$target" "$f"
+            fi
+          done
+
+          # Remove .old backups
+          rm -f *.old
+
+      - name: Upload updated database to R2
+        if: steps.diff.outputs.has_changes == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          cd /work
+          ENDPOINT="--endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          BUCKET="s3://shorin-arch-repo/archlinux/x86_64"
+
+          for f in \
+            shorin-arch.db.tar.zst \
+            shorin-arch.db.tar.zst.sig \
+            shorin-arch.files.tar.zst \
+            shorin-arch.files.tar.zst.sig \
+            shorin-arch.db \
+            shorin-arch.db.sig \
+            shorin-arch.files \
+            shorin-arch.files.sig; do
+            if [ -f "$f" ]; then
+              echo "Uploading: $f"
+              aws s3 cp "$f" "${BUCKET}/${f}" ${ENDPOINT}
+            fi
+          done
+
+          echo "Database update complete."
