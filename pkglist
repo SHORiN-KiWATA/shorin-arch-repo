@@ -29,5 +29,8 @@ nvidia-470xx-settings
 nvidia-470xx-utils
 nvidia-470xx-dkms
 opencl-nvidia-470xx
-
-
+# === AUR runtime dependencies (not in official repos, hard to download in China) ===
+dwarfs-bin
+lsfg-vk-bin
+mangojuice
+video-downloader
