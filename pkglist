@@ -15,7 +15,7 @@ shorin-proton-wrapper-git
 shorin-screenrec-menu-git
 ttf-jetbrains-maple-mono-nf-xx-xx
 ttf-lxgw-wenkai-screen
-waypaper
+niri-shorin-fork-git
 wl-longshot-git
 pins-git
 lsfg-vk-bin
@@ -23,6 +23,10 @@ mangojuice
 video-downloader
 protonplus
 typora-free
+# === waypaper === 
+waypaper
+python-imageio-ffmpe
+python-screeninfo
 
 # === gearlever ===
 gearlever
