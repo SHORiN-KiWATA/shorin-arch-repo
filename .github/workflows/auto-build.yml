@@ -223,6 +223,35 @@ jobs:
               cd "$actual_dir"
             fi
 
+            # === Resolve AUR dependencies (not as packages in our repo) ===
+            echo "  Resolving dependencies..."
+            cd "$actual_dir"
+
+            # Extract all dependency arrays from PKGBUILD
+            ALL_DEPS=$(bash -c '
+              source PKGBUILD 2>/dev/null
+              for arr in depends makedepends checkdepends; do
+                eval "vals=(\"\${${arr}[@]}\")"
+                for v in "${vals[@]}"; do
+                  # Strip version constraints like >=1.0
+                  echo "$v" | sed "s/[<>=].*//"
+                done
+              done
+            ' 2>/dev/null | sort -u)
+
+            # Try pacman first, then yay for AUR-only deps
+            for dep in $ALL_DEPS; do
+              if pacman -Qi "$dep" >/dev/null 2>&1; then
+                continue
+              fi
+              if pacman -Si "$dep" >/dev/null 2>&1; then
+                sudo -u builder sudo pacman -S --noconfirm --asdeps "$dep" >/dev/null 2>&1
+              else
+                echo "  Installing AUR dependency: $dep"
+                sudo -u builder yay -S --noconfirm --asdeps --answerclean All --answerdiff None "$dep" 2>&1 | tail -3
+              fi
+            done
+
             # === Build phase (reuse same directory) ===
             echo "  Building..."
             if ! sudo -u builder yay -B "$actual_dir" --noconfirm --mflags "--skippgpcheck" --answerclean All --answerdiff None 2>&1 | tail -10; then
