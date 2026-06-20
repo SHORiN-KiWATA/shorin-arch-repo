@@ -30,10 +30,12 @@ python-desktop-entry-lib
 
 # === nvidia drivers ===
 nvidia-580xx-settings
+libxnvctrl-580xx
 nvidia-580xx-utils
 nvidia-580xx-dkms
 opencl-nvidia-580xx
 nvidia-470xx-settings
+libxnvctrl-470xx
 nvidia-470xx-utils
 nvidia-470xx-dkms
 opencl-nvidia-470xx
