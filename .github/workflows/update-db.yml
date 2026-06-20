@@ -73,18 +73,23 @@ jobs:
           if [ ! -f "$DB" ]; then
             echo "No existing database, all packages are new"
             : > /work/db-entries.txt
+            : > /work/db-filenames.txt
             exit 0
           fi
 
           tar -xOf "$DB" --wildcards '*/desc' 2>/dev/null \
             | awk '
-                /^%NAME%/    { getline name; next }
-                /^%VERSION%/ { getline ver; next }
-                /^$/         {
+                /^%NAME%/     { getline name; next }
+                /^%VERSION%/  { getline ver; next }
+                /^%FILENAME%/ { getline fname; next }
+                /^$/          {
                     if (name != "" && ver != "") {
                         print name " " ver
-                        name=""; ver=""
                     }
+                    if (name != "" && fname != "") {
+                        print name " " fname
+                    }
+                    name=""; ver=""; fname=""
                     next
                 }
                 END {
@@ -94,16 +99,41 @@ jobs:
               ' \
             | sort -u > /work/db-entries.txt
 
+          # Parse filename mapping separately
+          tar -xOf "$DB" --wildcards '*/desc' 2>/dev/null \
+            | awk '
+                /^%NAME%/     { getline name; next }
+                /^%FILENAME%/ { getline fname; next }
+                /^$/          {
+                    if (name != "" && fname != "") {
+                        print name " " fname
+                        name=""; fname=""
+                    }
+                    next
+                }
+                END {
+                    if (name != "" && fname != "")
+                        print name " " fname
+                }
+              ' \
+            | sort -u > /work/db-filenames.txt
+
           echo "Database has $(wc -l < /work/db-entries.txt) entries"
 
       - name: Check if update is needed
         id: check
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
         run: |
           cd /work
           NEED_UPDATE=false
           REASON=""
+
+          ENDPOINT="--endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          BUCKET="s3://shorin-arch-repo/archlinux/x86_64"
 
           # --- Check 1: Signature validity ---
           if [ -f shorin-arch.db.tar.zst.sig ] && [ -f shorin-arch.db.tar.zst ]; then
@@ -164,7 +194,6 @@ jobs:
 
           # --- Check 3: Orphaned db entries (in db but not on R2) ---
           > /work/orphan-names.txt
-          PKGLIST_NAMES=$(grep -v '^#' pkglist | grep -v '^$' | sort -u)
           declare -A R2_PKG_NAMES
           while read -r pkgfile; do
             [ -z "$pkgfile" ] && continue
@@ -178,18 +207,27 @@ jobs:
             R2_PKG_NAMES["$pkgname"]=1
           done < /work/r2-packages.txt
 
+          # Build pkgname -> filename mapping from db
+          declare -A DB_FILENAMES
+          while read -r db_fname_name db_fname_file; do
+            [ -n "$db_fname_name" ] && DB_FILENAMES["$db_fname_name"]="$db_fname_file"
+          done < /work/db-filenames.txt
+
           while read -r db_name db_ver; do
             [ -z "$db_name" ] && continue
             if [ -z "${R2_PKG_NAMES[$db_name]}" ]; then
-              # Only remove if not in pkglist (protect against incomplete R2 listings)
-              if ! echo "$PKGLIST_NAMES" | grep -qx "$db_name"; then
-                echo "ORPHAN DB ENTRY: $db_name (in db but not on R2 and not in pkglist)"
-                echo "$db_name" >> /work/orphan-names.txt
-                NEED_UPDATE=true
-                REASON="$REASON; orphaned db entry $db_name"
-              else
-                echo "WARN: $db_name missing from R2 but in pkglist, skipping removal"
+              # Not in R2 listing — verify with explicit check
+              db_file="${DB_FILENAMES[$db_name]:-}"
+              if [ -n "$db_file" ]; then
+                if aws s3 ls "${BUCKET}/${db_file}" ${ENDPOINT} >/dev/null 2>&1; then
+                  echo "WARN: $db_name missing from R2 listing but file exists, skipping removal"
+                  continue
+                fi
               fi
+              echo "ORPHAN DB ENTRY: $db_name (file not found on R2)"
+              echo "$db_name" >> /work/orphan-names.txt
+              NEED_UPDATE=true
+              REASON="$REASON; orphaned db entry $db_name"
             fi
           done < /work/db-entries.txt
 
