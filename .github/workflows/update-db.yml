@@ -18,10 +18,25 @@ jobs:
           pacman -S --noconfirm aws-cli sudo
 
       - name: Configure GPG
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
           echo "pinentry-mode loopback" > ~/.gnupg/gpg-agent.conf
           echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          # Restart gpg-agent to load new config
+          gpgconf --kill gpg-agent 2>/dev/null || true
+          gpgconf --launch gpg-agent 2>/dev/null || true
+          # Preset the passphrase so repo-add's internal gpg call can use it
+          GPG_KEY_ID="8ED9ABE61CDBAABAC4B6A694C9218E60C13B4BA8"
+          KEYGRIP=$(gpg --with-keygrip --list-secret-keys "$GPG_KEY_ID" 2>/dev/null \
+            | awk '/Keygrip/ {print $3; exit}')
+          if [ -n "$KEYGRIP" ]; then
+            /usr/lib/gnupg/gpg-preset-passphrase --preset "$KEYGRIP" <<< "$GPG_PASSPHRASE" 2>/dev/null \
+              || echo "WARN: gpg-preset-passphrase not available, will rely on loopback"
+          else
+            echo "WARN: Could not determine keygrip"
+          fi
 
       - name: Download existing database
         env:
@@ -170,20 +185,27 @@ jobs:
 
       - name: Update database with repo-add
         if: steps.diff.outputs.has_changes == 'true'
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           cd /work
+          GPG_KEY_ID="8ED9ABE61CDBAABAC4B6A694C9218E60C13B4BA8"
 
           # Remove repo-add backup files if any
           rm -f *.old
 
           # repo-add updates both .db.tar.zst and .files.tar.zst
-          # --sign signs the database files, --key specifies the GPG key
-          repo-add --sign --key 8ED9ABE61CDBAABAC4B6A694C9218E60C13B4BA8 \
-            shorin-arch.db.tar.zst /tmp/newpkgs/*.pkg.tar.zst
+          repo-add shorin-arch.db.tar.zst /tmp/newpkgs/*.pkg.tar.zst
 
-          # repo-add creates symlinks: shorin-arch.db -> shorin-arch.db.tar.zst
-          # and shorin-arch.files -> shorin-arch.files.tar.zst
-          # Replace symlinks with real copies so aws s3 cp uploads them properly
+          # Sign database files manually (repo-add --sign is unreliable in CI)
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$GPG_PASSPHRASE" \
+            --detach-sign --no-armor shorin-arch.db.tar.zst
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$GPG_PASSPHRASE" \
+            --detach-sign --no-armor shorin-arch.files.tar.zst
+
+          # Create no-suffix copies (pacman looks for shorin-arch.db etc.)
           for f in shorin-arch.db shorin-arch.files; do
             if [ -L "$f" ]; then
               target=$(readlink -f "$f")
@@ -191,8 +213,6 @@ jobs:
               cp "$target" "$f"
             fi
           done
-
-          # Same for .sig symlinks
           for f in shorin-arch.db.sig shorin-arch.files.sig; do
             if [ -L "$f" ]; then
               target=$(readlink -f "$f")
@@ -200,6 +220,10 @@ jobs:
               cp "$target" "$f"
             fi
           done
+
+          # Verify signatures locally before uploading
+          gpg --verify shorin-arch.db.tar.zst.sig shorin-arch.db.tar.zst
+          gpg --verify shorin-arch.files.tar.zst.sig shorin-arch.files.tar.zst
 
           # Remove .old backups
           rm -f *.old
