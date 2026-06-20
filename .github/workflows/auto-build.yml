@@ -281,6 +281,7 @@ jobs:
             # Find built packages
             for pkgfile in *.pkg.tar.zst; do
               [ -f "$pkgfile" ] || continue
+              [[ "$pkgfile" == *-debug-* ]] && continue
 
               # Extract version and compare with DB
               BASE_NAME=$(echo "$pkgfile" | sed -E 's/-[^-]+-[^-]+-[^-]+\.pkg\.tar\.zst$//')
