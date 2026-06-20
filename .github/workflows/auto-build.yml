@@ -16,6 +16,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Prepare environment
+        shell: bash
         run: |
           pacman -Syu --noconfirm
           pacman -S --noconfirm aws-cli sudo git jq
@@ -27,6 +28,7 @@ jobs:
           chown -R builder:builder /work /release
 
       - name: Configure GPG
+        shell: bash
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
@@ -37,6 +39,7 @@ jobs:
           gpgconf --launch gpg-agent 2>/dev/null || true
 
       - name: Download R2 database and parse versions
+        shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -74,8 +77,8 @@ jobs:
           cat /work/db-versions.txt
 
       - name: Query AUR RPC API
+        shell: bash
         run: |
-          # Read pkglist, build query URL
           PACKAGES=$(grep -v '^#' pkglist | grep -v '^$' | tr '\n' ' ')
           QUERY=""
           for pkg in $PACKAGES; do
@@ -87,7 +90,6 @@ jobs:
           RESULT_COUNT=$(jq '.resultcount' /work/aur-info.json)
           echo "AUR returned $RESULT_COUNT packages"
 
-          # Save as: Name Version PackageBase
           jq -r '.results[] | "\(.Name) \(.Version) \(.PackageBase)"' /work/aur-info.json \
             | sort -u > /work/aur-versions.txt
 
@@ -95,6 +97,7 @@ jobs:
           cat /work/aur-versions.txt
 
       - name: Detect packages needing rebuild
+        shell: bash
         run: |
           # Build db version lookup
           declare -A DB_VER
@@ -116,62 +119,73 @@ jobs:
             fi
 
             if [[ "$aur_name" == *-git ]]; then
-              # For -git packages, RPC version may be stale (PKGBUILD not updated
-              # but upstream git has new commits). We need to clone AUR repo,
-              # run makepkg -od to fetch sources, then execute pkgver() to get
-              # the actual version.
-
               echo "Checking -git package: $aur_name (AUR RPC: $aur_ver, DB: $db_ver)"
 
               check_dir="/tmp/check/${aur_name}"
               rm -rf "$check_dir"
               mkdir -p /tmp/check
-              git clone --quiet "https://aur.archlinux.org/${aur_base}.git" "$check_dir" 2>/dev/null
-              if [ $? -ne 0 ]; then
+
+              if ! git clone --quiet "https://aur.archlinux.org/${aur_base}.git" "$check_dir" 2>/dev/null; then
                 echo "  ERROR: Failed to clone AUR repo for $aur_name, skipping"
                 continue
               fi
 
               cd "$check_dir"
 
-              # makepkg -od: download sources only, no build. This populates src/
-              # so pkgver() can run.
-              sudo -u builder makepkg -od --noconfirm 2>/dev/null
-              if [ $? -ne 0 ]; then
-                echo "  ERROR: makepkg -od failed for $aur_name, falling back to RPC version"
-                computed_ver="$aur_ver"
-              else
-                # Source PKGBUILD and run pkgver()
-                computed_ver=$(bash -c '
+              # makepkg -od: download sources only, no build.
+              # Use --nodeps to avoid needing all makedepends installed just for version check.
+              if ! sudo -u builder makepkg -od --noconfirm --nodeps 2>&1; then
+                echo "  ERROR: makepkg -od failed for $aur_name, trying with RPC version"
+                # Fall back: try vercmp with the AUR RPC version
+                if [ "$(vercmp "$aur_ver" "$db_ver")" -gt 0 ]; then
+                  echo "  NEEDS REBUILD (RPC): $aur_name $db_ver -> $aur_ver"
+                  echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
+                else
+                  echo "  UP TO DATE: $aur_name"
+                fi
+                cd /work
+                rm -rf "$check_dir"
+                continue
+              fi
+
+              # Source PKGBUILD and run pkgver() in the srcdir context
+              # makepkg -od sets srcdir in $PWD/src
+              computed_ver=$(sudo -u builder bash -c '
+                set +e
+                source PKGBUILD 2>/dev/null
+                if [ -d "$srcdir" ]; then
+                  cd "$srcdir"
+                fi
+                pkgver 2>/dev/null
+              ' 2>/dev/null)
+
+              if [ -z "$computed_ver" ]; then
+                echo "  pkgver() failed, trying alternative approach..."
+                computed_ver=$(sudo -u builder bash -c '
+                  set +e
                   source PKGBUILD 2>/dev/null
-                  cd "$srcdir" 2>/dev/null || exit 1
-                  # pkgver() needs to run in the source directory context
-                  # but some PKGBUILDs reference $startdir
                   pkgver 2>/dev/null
                 ' 2>/dev/null)
-
-                if [ -z "$computed_ver" ]; then
-                  echo "  pkgver() failed in srcdir, trying alternative..."
-                  computed_ver=$(bash -c '
-                    source PKGBUILD 2>/dev/null
-                    pkgver 2>/dev/null
-                  ' 2>/dev/null)
-                fi
-
-                if [ -z "$computed_ver" ]; then
-                  echo "  ERROR: Could not compute pkgver for $aur_name, falling back to RPC version"
-                  computed_ver="${aur_ver%%-*}"
-                fi
               fi
 
-              # Get pkgrel from PKGBUILD
+              if [ -z "$computed_ver" ]; then
+                echo "  ERROR: Could not compute pkgver for $aur_name"
+                # Fall back to RPC version
+                if [ "$(vercmp "$aur_ver" "$db_ver")" -gt 0 ]; then
+                  echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
+                else
+                  echo "  UP TO DATE: $aur_name"
+                fi
+                cd /work
+                rm -rf "$check_dir"
+                continue
+              fi
+
+              # Get pkgrel
               pkgrel=$(bash -c 'source PKGBUILD 2>/dev/null; echo "$pkgrel"' 2>/dev/null)
-              if [ -z "$pkgrel" ]; then
-                pkgrel="1"
-              fi
+              [ -z "$pkgrel" ] && pkgrel="1"
 
               full_ver="${computed_ver}-${pkgrel}"
-
               echo "  Computed version: $full_ver (DB: $db_ver)"
 
               if [ "$(vercmp "$full_ver" "$db_ver")" -gt 0 ]; then
@@ -201,7 +215,8 @@ jobs:
           cat /work/rebuild-list.txt
 
       - name: Build, sign, and upload packages
-        if: ${{ hashFiles('/work/rebuild-list.txt') != '' }}
+        if: hashFiles('/work/rebuild-list.txt') != '' && !cancelled()
+        shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -213,6 +228,12 @@ jobs:
           R2_PREFIX="${BUCKET}/"
 
           > /work/build-results.txt
+
+          # Skip if rebuild-list is empty
+          if [ ! -s /work/rebuild-list.txt ]; then
+            echo "No packages to build."
+            exit 0
+          fi
 
           while read -r pkg_name pkg_base pkg_ver; do
             [ -z "$pkg_name" ] && continue
@@ -286,6 +307,8 @@ jobs:
           cat /work/build-results.txt
 
       - name: Summary
+        if: always()
+        shell: bash
         run: |
           echo "## Auto Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
