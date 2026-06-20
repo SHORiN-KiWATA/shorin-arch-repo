@@ -37,6 +37,9 @@ jobs:
           # Configure yay for non-interactive use
           sudo -u builder yay --save --answerclean All --answerdiff None --answeredit None --noeditmenu --nodiffmenu 2>/dev/null || true
 
+          # Pre-install slow-to-build AUR deps as -bin variants
+          sudo -u builder yay -S --noconfirm --asdeps dwarfs-bin 2>/dev/null || true
+
       - name: Configure GPG
         shell: bash
         env:
@@ -242,6 +245,10 @@ jobs:
             # Try pacman first, then yay for AUR-only deps
             for dep in $ALL_DEPS; do
               if pacman -Qi "$dep" >/dev/null 2>&1; then
+                continue
+              fi
+              # Also check if any installed package provides this dependency
+              if pacman -Qi 2>/dev/null | awk '/^%PROVIDES%/{getline;n=split($0,a," ");for(i=1;i<=n;i++)print a[i]}' | grep -qx "$dep"; then
                 continue
               fi
               if pacman -Si "$dep" >/dev/null 2>&1; then
