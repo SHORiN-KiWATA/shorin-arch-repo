@@ -81,15 +81,12 @@ jobs:
             | awk '
                 /^%NAME%/     { getline name; next }
                 /^%VERSION%/  { getline ver; next }
-                /^%FILENAME%/ { getline fname; next }
+                /^%FILENAME%/ { next }
                 /^$/          {
                     if (name != "" && ver != "") {
                         print name " " ver
+                        name=""; ver=""
                     }
-                    if (name != "" && fname != "") {
-                        print name " " fname
-                    }
-                    name=""; ver=""; fname=""
                     next
                 }
                 END {
@@ -192,8 +189,17 @@ jobs:
             fi
           done < /work/r2-packages.txt
 
-          # --- Check 3: Orphaned db entries (in db but not on R2) ---
+          # --- Check 3: Orphaned db entries ---
           > /work/orphan-names.txt
+          PKGLIST_NAMES=$(grep -v '^#' pkglist | grep -v '^$' | sort -u)
+
+          # Build pkgname -> filename mapping from db
+          declare -A DB_FILENAMES
+          while read -r db_fname_name db_fname_file; do
+            [ -n "$db_fname_name" ] && DB_FILENAMES["$db_fname_name"]="$db_fname_file"
+          done < /work/db-filenames.txt
+
+          # Build R2 pkgname set
           declare -A R2_PKG_NAMES
           while read -r pkgfile; do
             [ -z "$pkgfile" ] && continue
@@ -207,16 +213,26 @@ jobs:
             R2_PKG_NAMES["$pkgname"]=1
           done < /work/r2-packages.txt
 
-          # Build pkgname -> filename mapping from db
-          declare -A DB_FILENAMES
-          while read -r db_fname_name db_fname_file; do
-            [ -n "$db_fname_name" ] && DB_FILENAMES["$db_fname_name"]="$db_fname_file"
-          done < /work/db-filenames.txt
-
+          # Check 3a: db entry not in pkglist → repo-remove (db only, R2 files cleaned by stale cleanup)
           while read -r db_name db_ver; do
             [ -z "$db_name" ] && continue
+            if ! echo "$PKGLIST_NAMES" | grep -qx "$db_name"; then
+              echo "ORPHAN DB ENTRY (not in pkglist): $db_name"
+              echo "$db_name" >> /work/orphan-names.txt
+              NEED_UPDATE=true
+              REASON="$REASON; orphaned db entry $db_name"
+            fi
+          done < /work/db-entries.txt
+
+          # Check 3b: db entry in pkglist but R2 file missing → verify then repo-remove
+          while read -r db_name db_ver; do
+            [ -z "$db_name" ] && continue
+            # Skip already marked by 3a
+            grep -qx "$db_name" /work/orphan-names.txt 2>/dev/null && continue
+            # Only check packages in pkglist
+            echo "$PKGLIST_NAMES" | grep -qx "$db_name" || continue
+            # Check if in R2 listing
             if [ -z "${R2_PKG_NAMES[$db_name]}" ]; then
-              # Not in R2 listing — verify with explicit check
               db_file="${DB_FILENAMES[$db_name]:-}"
               if [ -n "$db_file" ]; then
                 if aws s3 ls "${BUCKET}/${db_file}" ${ENDPOINT} >/dev/null 2>&1; then
@@ -224,7 +240,7 @@ jobs:
                   continue
                 fi
               fi
-              echo "ORPHAN DB ENTRY: $db_name (file not found on R2)"
+              echo "ORPHAN DB ENTRY (file not found on R2): $db_name"
               echo "$db_name" >> /work/orphan-names.txt
               NEED_UPDATE=true
               REASON="$REASON; orphaned db entry $db_name"
