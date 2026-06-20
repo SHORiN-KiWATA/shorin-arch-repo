@@ -147,10 +147,12 @@ jobs:
             mkdir -p /work/build
             chown -R builder:builder /work/build
 
-            # Clone AUR repo (single clone, reused for detect + build)
-            if ! sudo -u builder yay -G -a "$aur_base" --builddir /work/build 2>&1; then
+            # Clone AUR repo (yay -G downloads to CWD, not --builddir)
+            cd /work/build
+            if ! sudo -u builder yay -G -a "$aur_base" 2>&1; then
               echo "  FAILED: Could not clone $aur_base"
               echo "FAILED $aur_name (clone error)" >> /work/build-results.txt
+              cd /work
               continue
             fi
 
