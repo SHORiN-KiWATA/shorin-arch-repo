@@ -12,6 +12,9 @@ jobs:
       image: archlinux:base-devel
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Prepare environment
         run: |
           pacman -Syu --noconfirm
@@ -161,6 +164,7 @@ jobs:
 
           # --- Check 3: Orphaned db entries (in db but not on R2) ---
           > /work/orphan-names.txt
+          PKGLIST_NAMES=$(grep -v '^#' pkglist | grep -v '^$' | sort -u)
           declare -A R2_PKG_NAMES
           while read -r pkgfile; do
             [ -z "$pkgfile" ] && continue
@@ -177,10 +181,15 @@ jobs:
           while read -r db_name db_ver; do
             [ -z "$db_name" ] && continue
             if [ -z "${R2_PKG_NAMES[$db_name]}" ]; then
-              echo "ORPHAN DB ENTRY: $db_name (in db but not on R2)"
-              echo "$db_name" >> /work/orphan-names.txt
-              NEED_UPDATE=true
-              REASON="$REASON; orphaned db entry $db_name"
+              # Only remove if not in pkglist (protect against incomplete R2 listings)
+              if ! echo "$PKGLIST_NAMES" | grep -qx "$db_name"; then
+                echo "ORPHAN DB ENTRY: $db_name (in db but not on R2 and not in pkglist)"
+                echo "$db_name" >> /work/orphan-names.txt
+                NEED_UPDATE=true
+                REASON="$REASON; orphaned db entry $db_name"
+              else
+                echo "WARN: $db_name missing from R2 but in pkglist, skipping removal"
+              fi
             fi
           done < /work/db-entries.txt
 
@@ -257,6 +266,7 @@ jobs:
 
           # Clean up stale package files on R2 (not referenced by updated db)
           echo "Checking for stale package files on R2..."
+          PKGLIST_NAMES=$(grep -v '^#' pkglist | grep -v '^$' | sort -u)
           DB_FILES=$(tar -xOf shorin-arch.db.tar.zst --wildcards '*/desc' 2>/dev/null \
             | awk '
                 /^%FILENAME%/ { getline fname; next }
@@ -275,10 +285,16 @@ jobs:
           while read -r r2_pkg; do
             [ -z "$r2_pkg" ] && continue
             if ! echo "$DB_FILES" | grep -qx "$r2_pkg"; then
-              echo "  STALE: $r2_pkg"
-              aws s3 rm "${BUCKET}/${r2_pkg}" ${ENDPOINT} 2>/dev/null || true
-              aws s3 rm "${BUCKET}/${r2_pkg}.sig" ${ENDPOINT} 2>/dev/null || true
-              STALE_COUNT=$((STALE_COUNT + 1))
+              r2_pkgname=$(echo "$r2_pkg" | sed -E 's/-[^-]+-[^-]+-[^-]+\.pkg\.tar\.zst$//')
+              # Only delete if not in pkglist (protect against incomplete db parsing)
+              if ! echo "$PKGLIST_NAMES" | grep -qx "$r2_pkgname"; then
+                echo "  STALE: $r2_pkg"
+                aws s3 rm "${BUCKET}/${r2_pkg}" ${ENDPOINT} 2>/dev/null || true
+                aws s3 rm "${BUCKET}/${r2_pkg}.sig" ${ENDPOINT} 2>/dev/null || true
+                STALE_COUNT=$((STALE_COUNT + 1))
+              else
+                echo "  WARN: $r2_pkg not in db but pkgname in pkglist, keeping"
+              fi
             fi
           done <<< "$R2_PKG_FILES"
           echo "Stale files removed: $STALE_COUNT"
