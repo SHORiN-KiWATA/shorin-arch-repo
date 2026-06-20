@@ -35,6 +35,7 @@ jobs:
           AWS_DEFAULT_REGION: auto
         run: |
           mkdir -p /work /tmp/newpkgs
+          cp "${GITHUB_WORKSPACE}/pkglist" /work/pkglist
           cd /work
           ENDPOINT="--endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
           BUCKET="s3://shorin-arch-repo/archlinux/x86_64"
