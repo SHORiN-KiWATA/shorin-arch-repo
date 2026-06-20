@@ -1,0 +1,309 @@
+name: Auto Build Packages
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  auto-build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare environment
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm aws-cli sudo git jq
+          useradd -m builder
+          mkdir -p /etc/sudoers.d
+          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+          chmod 440 /etc/sudoers.d/builder
+          mkdir -p /work /release
+          chown -R builder:builder /work /release
+
+      - name: Configure GPG
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          echo "pinentry-mode loopback" > ~/.gnupg/gpg-agent.conf
+          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          gpgconf --kill gpg-agent 2>/dev/null || true
+          gpgconf --launch gpg-agent 2>/dev/null || true
+
+      - name: Download R2 database and parse versions
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          ENDPOINT="--endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          BUCKET="s3://shorin-arch-repo/archlinux/x86_64"
+
+          aws s3 cp ${BUCKET}/shorin-arch.db.tar.zst /work/shorin-arch.db.tar.zst ${ENDPOINT} \
+            || echo "WARN: No existing db"
+
+          if [ -f /work/shorin-arch.db.tar.zst ]; then
+            tar -xOf /work/shorin-arch.db.tar.zst --wildcards '*/desc' 2>/dev/null \
+              | awk '
+                  /^%NAME%/    { getline name; next }
+                  /^%VERSION%/ { getline ver; next }
+                  /^$/         {
+                      if (name != "" && ver != "") {
+                          print name " " ver
+                          name=""; ver=""
+                      }
+                      next
+                  }
+                  END {
+                      if (name != "" && ver != "")
+                          print name " " ver
+                  }
+                ' \
+              | sort -u > /work/db-versions.txt
+          else
+            : > /work/db-versions.txt
+          fi
+
+          echo "Database versions:"
+          cat /work/db-versions.txt
+
+      - name: Query AUR RPC API
+        run: |
+          # Read pkglist, build query URL
+          PACKAGES=$(grep -v '^#' pkglist | grep -v '^$' | tr '\n' ' ')
+          QUERY=""
+          for pkg in $PACKAGES; do
+            QUERY="${QUERY}arg[]=${pkg}&"
+          done
+
+          curl -s "https://aur.archlinux.org/rpc/?v=5&type=info&${QUERY}" > /work/aur-info.json
+
+          RESULT_COUNT=$(jq '.resultcount' /work/aur-info.json)
+          echo "AUR returned $RESULT_COUNT packages"
+
+          # Save as: Name Version PackageBase
+          jq -r '.results[] | "\(.Name) \(.Version) \(.PackageBase)"' /work/aur-info.json \
+            | sort -u > /work/aur-versions.txt
+
+          echo "AUR versions:"
+          cat /work/aur-versions.txt
+
+      - name: Detect packages needing rebuild
+        run: |
+          # Build db version lookup
+          declare -A DB_VER
+          while read -r name ver; do
+            [ -n "$name" ] && DB_VER["$name"]="$ver"
+          done < /work/db-versions.txt
+
+          > /work/rebuild-list.txt
+
+          while read -r aur_name aur_ver aur_base; do
+            [ -z "$aur_name" ] && continue
+
+            db_ver="${DB_VER[$aur_name]:-}"
+
+            if [ -z "$db_ver" ]; then
+              echo "NEW (not in db): $aur_name $aur_ver"
+              echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
+              continue
+            fi
+
+            if [[ "$aur_name" == *-git ]]; then
+              # For -git packages, RPC version may be stale (PKGBUILD not updated
+              # but upstream git has new commits). We need to clone AUR repo,
+              # run makepkg -od to fetch sources, then execute pkgver() to get
+              # the actual version.
+
+              echo "Checking -git package: $aur_name (AUR RPC: $aur_ver, DB: $db_ver)"
+
+              check_dir="/tmp/check/${aur_name}"
+              rm -rf "$check_dir"
+              mkdir -p /tmp/check
+              git clone --quiet "https://aur.archlinux.org/${aur_base}.git" "$check_dir" 2>/dev/null
+              if [ $? -ne 0 ]; then
+                echo "  ERROR: Failed to clone AUR repo for $aur_name, skipping"
+                continue
+              fi
+
+              cd "$check_dir"
+
+              # makepkg -od: download sources only, no build. This populates src/
+              # so pkgver() can run.
+              sudo -u builder makepkg -od --noconfirm 2>/dev/null
+              if [ $? -ne 0 ]; then
+                echo "  ERROR: makepkg -od failed for $aur_name, falling back to RPC version"
+                computed_ver="$aur_ver"
+              else
+                # Source PKGBUILD and run pkgver()
+                computed_ver=$(bash -c '
+                  source PKGBUILD 2>/dev/null
+                  cd "$srcdir" 2>/dev/null || exit 1
+                  # pkgver() needs to run in the source directory context
+                  # but some PKGBUILDs reference $startdir
+                  pkgver 2>/dev/null
+                ' 2>/dev/null)
+
+                if [ -z "$computed_ver" ]; then
+                  echo "  pkgver() failed in srcdir, trying alternative..."
+                  computed_ver=$(bash -c '
+                    source PKGBUILD 2>/dev/null
+                    pkgver 2>/dev/null
+                  ' 2>/dev/null)
+                fi
+
+                if [ -z "$computed_ver" ]; then
+                  echo "  ERROR: Could not compute pkgver for $aur_name, falling back to RPC version"
+                  computed_ver="${aur_ver%%-*}"
+                fi
+              fi
+
+              # Get pkgrel from PKGBUILD
+              pkgrel=$(bash -c 'source PKGBUILD 2>/dev/null; echo "$pkgrel"' 2>/dev/null)
+              if [ -z "$pkgrel" ]; then
+                pkgrel="1"
+              fi
+
+              full_ver="${computed_ver}-${pkgrel}"
+
+              echo "  Computed version: $full_ver (DB: $db_ver)"
+
+              if [ "$(vercmp "$full_ver" "$db_ver")" -gt 0 ]; then
+                echo "  NEEDS REBUILD: $aur_name $db_ver -> $full_ver"
+                echo "$aur_name $aur_base $full_ver" >> /work/rebuild-list.txt
+              else
+                echo "  UP TO DATE: $aur_name"
+              fi
+
+              cd /work
+              rm -rf "$check_dir"
+            else
+              # Non-git package: use RPC version directly
+              if [ "$(vercmp "$aur_ver" "$db_ver")" -gt 0 ]; then
+                echo "UPDATE: $aur_name $db_ver -> $aur_ver"
+                echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
+              else
+                echo "UP TO DATE: $aur_name"
+              fi
+            fi
+          done < /work/aur-versions.txt
+
+          REBUILD_COUNT=$(wc -l < /work/rebuild-list.txt)
+          echo ""
+          echo "=== Summary ==="
+          echo "Packages needing rebuild: $REBUILD_COUNT"
+          cat /work/rebuild-list.txt
+
+      - name: Build, sign, and upload packages
+        if: ${{ hashFiles('/work/rebuild-list.txt') != '' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          ENDPOINT="--endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
+          BUCKET="s3://shorin-arch-repo/archlinux/x86_64"
+          R2_PREFIX="${BUCKET}/"
+
+          > /work/build-results.txt
+
+          while read -r pkg_name pkg_base pkg_ver; do
+            [ -z "$pkg_name" ] && continue
+
+            echo ""
+            echo "============================================"
+            echo "Building: $pkg_name (base: $pkg_base)"
+            echo "============================================"
+
+            build_dir="/work/build/${pkg_name}"
+            rm -rf "$build_dir"
+            mkdir -p "$build_dir"
+            chown builder:builder "$build_dir"
+
+            # Clone AUR repo
+            if ! sudo -u builder git clone --quiet "https://aur.archlinux.org/${pkg_base}.git" "$build_dir"; then
+              echo "FAILED: Could not clone $pkg_base"
+              echo "FAILED $pkg_name (clone error)" >> /work/build-results.txt
+              continue
+            fi
+
+            # Build
+            cd "$build_dir"
+            if ! sudo -u builder makepkg -s --noconfirm --skippgpcheck 2>&1; then
+              echo "FAILED: makepkg failed for $pkg_name"
+              echo "FAILED $pkg_name (makepkg error)" >> /work/build-results.txt
+              cd /work
+              continue
+            fi
+
+            # Find and move built packages
+            for pkgfile in *.pkg.tar.zst; do
+              [ -f "$pkgfile" ] || continue
+              cp "$pkgfile" "/release/${pkgfile}"
+
+              # Sign the package
+              gpg --batch --yes --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" \
+                --detach-sign --no-armor "/release/${pkgfile}"
+
+              echo "Built and signed: $pkgfile"
+
+              # Extract base name for cleanup
+              BASE_NAME=$(echo "$pkgfile" | sed -E 's/-[^-]+-[^-]+-[^-]+\.pkg\.tar\.zst$//')
+
+              # Remove old versions on R2
+              for R2_OBJ in $(aws s3 ls ${R2_PREFIX} ${ENDPOINT} | awk '{print $4}' | grep "\.pkg\.tar\.zst$"); do
+                [ "$R2_OBJ" = "$pkgfile" ] && continue
+                R2_BASE=$(echo "$R2_OBJ" | sed -E 's/-[^-]+-[^-]+-[^-]+\.pkg\.tar\.zst$//')
+                [ "$R2_BASE" = "$BASE_NAME" ] || continue
+                echo "Removing old: $R2_OBJ"
+                aws s3 rm "${R2_PREFIX}${R2_OBJ}" ${ENDPOINT}
+                aws s3 rm "${R2_PREFIX}${R2_OBJ}.sig" ${ENDPOINT} 2>/dev/null || true
+              done
+
+              # Upload new package + sig
+              aws s3 cp "/release/${pkgfile}" "${R2_PREFIX}${pkgfile}" ${ENDPOINT}
+              aws s3 cp "/release/${pkgfile}.sig" "${R2_PREFIX}${pkgfile}.sig" ${ENDPOINT}
+
+              echo "Uploaded: $pkgfile + sig"
+              echo "OK $pkg_name ($pkgfile)" >> /work/build-results.txt
+            done
+
+            cd /work
+            rm -rf "$build_dir"
+
+          done < /work/rebuild-list.txt
+
+          echo ""
+          echo "=== Build Results ==="
+          cat /work/build-results.txt
+
+      - name: Summary
+        run: |
+          echo "## Auto Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -f /work/rebuild-list.txt ] && [ -s /work/rebuild-list.txt ]; then
+            REBUILD_COUNT=$(wc -l < /work/rebuild-list.txt)
+            echo "**Packages checked for rebuild:** ${REBUILD_COUNT}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            if [ -f /work/build-results.txt ] && [ -s /work/build-results.txt ]; then
+              echo "### Results" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "| Package | Status |" >> $GITHUB_STEP_SUMMARY
+              echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+              while read -r line; do
+                echo "| ${line} |" >> $GITHUB_STEP_SUMMARY
+              done < /work/build-results.txt
+            fi
+          else
+            echo "**All packages up to date.**" >> $GITHUB_STEP_SUMMARY
+          fi
