@@ -24,19 +24,8 @@ jobs:
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
           echo "pinentry-mode loopback" > ~/.gnupg/gpg-agent.conf
           echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
-          # Restart gpg-agent to load new config
           gpgconf --kill gpg-agent 2>/dev/null || true
           gpgconf --launch gpg-agent 2>/dev/null || true
-          # Preset the passphrase so repo-add's internal gpg call can use it
-          GPG_KEY_ID="8ED9ABE61CDBAABAC4B6A694C9218E60C13B4BA8"
-          KEYGRIP=$(gpg --with-keygrip --list-secret-keys "$GPG_KEY_ID" 2>/dev/null \
-            | awk '/Keygrip/ {print $3; exit}')
-          if [ -n "$KEYGRIP" ]; then
-            /usr/lib/gnupg/gpg-preset-passphrase --preset "$KEYGRIP" <<< "$GPG_PASSPHRASE" 2>/dev/null \
-              || echo "WARN: gpg-preset-passphrase not available, will rely on loopback"
-          else
-            echo "WARN: Could not determine keygrip"
-          fi
 
       - name: Download existing database
         env:
@@ -51,11 +40,14 @@ jobs:
 
           aws s3 cp ${BUCKET}/shorin-arch.db.tar.zst ./shorin-arch.db.tar.zst ${ENDPOINT} \
             || echo "WARN: No existing db, will create new one"
+          aws s3 cp ${BUCKET}/shorin-arch.db.tar.zst.sig ./shorin-arch.db.tar.zst.sig ${ENDPOINT} \
+            || echo "WARN: No existing db sig"
           aws s3 cp ${BUCKET}/shorin-arch.files.tar.zst ./shorin-arch.files.tar.zst ${ENDPOINT} \
             || echo "WARN: No existing files db, will create new one"
+          aws s3 cp ${BUCKET}/shorin-arch.files.tar.zst.sig ./shorin-arch.files.tar.zst.sig ${ENDPOINT} \
+            || echo "WARN: No existing files db sig"
 
       - name: List packages on R2
-        id: list-r2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -64,7 +56,6 @@ jobs:
           ENDPOINT="--endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
           BUCKET="s3://shorin-arch-repo/archlinux/x86_64"
 
-          # List all .pkg.tar.zst on R2 (filename only, strip directory prefix)
           aws s3 ls ${BUCKET}/ ${ENDPOINT} --recursive \
             | awk '{print $4}' \
             | grep -E '\.pkg\.tar\.zst$' \
@@ -84,8 +75,6 @@ jobs:
             exit 0
           fi
 
-          # Extract all desc files from the database and parse %NAME%/%VERSION% pairs
-          # Format inside desc: %NAME%\n<name>\n...\n%VERSION%\n<version>\n...
           tar -xOf "$DB" --wildcards '*/desc' 2>/dev/null \
             | awk '
                 /^%NAME%/    { getline name; next }
@@ -104,68 +93,87 @@ jobs:
               ' \
             | sort -u > /work/db-entries.txt
 
-          echo "Database has $(wc -l < /work/db-entries.txt) entries:"
-          cat /work/db-entries.txt
+          echo "Database has $(wc -l < /work/db-entries.txt) entries"
 
-      - name: Compute changed packages
-        id: diff
+      - name: Check if update is needed
+        id: check
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           cd /work
+          NEED_UPDATE=false
+          REASON=""
 
-          # Build a lookup of db entries: name -> version
+          # --- Check 1: Signature validity ---
+          if [ -f shorin-arch.db.tar.zst.sig ] && [ -f shorin-arch.db.tar.zst ]; then
+            if ! gpg --verify shorin-arch.db.tar.zst.sig shorin-arch.db.tar.zst 2>/dev/null; then
+              NEED_UPDATE=true
+              REASON="db signature invalid or missing"
+            fi
+          else
+            NEED_UPDATE=true
+            REASON="db signature file or db file missing"
+          fi
+
+          if [ -f shorin-arch.files.tar.zst.sig ] && [ -f shorin-arch.files.tar.zst ]; then
+            if ! gpg --verify shorin-arch.files.tar.zst.sig shorin-arch.files.tar.zst 2>/dev/null; then
+              NEED_UPDATE=true
+              REASON="$REASON; files signature invalid or missing"
+            fi
+          else
+            NEED_UPDATE=true
+            REASON="$REASON; files signature or files db missing"
+          fi
+
+          # --- Check 2: Package changes (new or updated packages) ---
           declare -A DB_VER
           while read -r name ver; do
             [ -n "$name" ] && DB_VER["$name"]="$ver"
           done < /work/db-entries.txt
 
-          # For each R2 package, extract base name and version, compare with db
           > /work/changed-packages.txt
 
           while read -r pkgfile; do
             [ -z "$pkgfile" ] && continue
 
-            # Extract base name and version from filename:
-            # <name>-<version>-<rel>-<arch>.pkg.tar.zst
-            # We need the LAST three dash-separated fields as rel, arch, suffix
-            # and everything before is name-version. But name can contain dashes.
-            # Strategy: strip known suffix, then split off last two dash fields (rel, arch)
-            # The remaining is <name>-<version>, split at the LAST dash.
             base="${pkgfile%.pkg.tar.zst}"
-
             arch="${base##*-}"
-            base="${base%-*}"          # strip arch
+            base="${base%-*}"
             rel="${base##*-}"
-            base="${base%-*}"          # strip rel
-            # Now base = <name>-<version>
-            pkgver="${base##*-}"       # version is after last dash
-            pkgname="${base%-*}"       # name is before last dash
+            base="${base%-*}"
+            pkgver="${base##*-}"
+            pkgname="${base%-*}"
 
             db_ver="${DB_VER[$pkgname]:-}"
 
             if [ -z "$db_ver" ]; then
               echo "NEW: $pkgname $pkgver ($pkgfile)"
               echo "$pkgfile" >> /work/changed-packages.txt
+              NEED_UPDATE=true
+              REASON="$REASON; new package $pkgname"
             else
-              # Compare versions using vercmp
               if [ "$(vercmp "$pkgver" "$db_ver")" -gt 0 ]; then
                 echo "UPDATE: $pkgname $db_ver -> $pkgver ($pkgfile)"
                 echo "$pkgfile" >> /work/changed-packages.txt
+                NEED_UPDATE=true
+                REASON="$REASON; updated $pkgname"
               fi
             fi
           done < /work/r2-packages.txt
 
           CHANGED_COUNT=$(wc -l < /work/changed-packages.txt)
           echo "Changed packages: $CHANGED_COUNT"
+          echo "Need update: $NEED_UPDATE"
+          echo "Reason: $REASON"
 
-          if [ "$CHANGED_COUNT" -eq 0 ]; then
-            echo "No changes detected, database is up to date."
-            echo "has_changes=false" >> $GITHUB_OUTPUT
+          if [ "$NEED_UPDATE" = "true" ]; then
+            echo "needs_update=true" >> $GITHUB_OUTPUT
           else
-            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "needs_update=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Download changed packages
-        if: steps.diff.outputs.has_changes == 'true'
+        if: steps.check.outputs.needs_update == 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -175,29 +183,40 @@ jobs:
           ENDPOINT="--endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
           BUCKET="s3://shorin-arch-repo/archlinux/x86_64"
 
-          while read -r pkgfile; do
-            [ -z "$pkgfile" ] && continue
-            echo "Downloading: $pkgfile"
-            aws s3 cp "${BUCKET}/${pkgfile}" "/tmp/newpkgs/${pkgfile}" ${ENDPOINT}
-          done < /work/changed-packages.txt
+          # Download ALL packages if db doesn't exist yet (fresh build)
+          if [ ! -f shorin-arch.db.tar.zst ]; then
+            echo "No existing db, downloading all packages..."
+            while read -r pkgfile; do
+              [ -z "$pkgfile" ] && continue
+              aws s3 cp "${BUCKET}/${pkgfile}" "/tmp/newpkgs/${pkgfile}" ${ENDPOINT}
+            done < /work/r2-packages.txt
+          else
+            while read -r pkgfile; do
+              [ -z "$pkgfile" ] && continue
+              echo "Downloading: $pkgfile"
+              aws s3 cp "${BUCKET}/${pkgfile}" "/tmp/newpkgs/${pkgfile}" ${ENDPOINT}
+            done < /work/changed-packages.txt
+          fi
 
           echo "Downloaded $(ls /tmp/newpkgs/*.pkg.tar.zst 2>/dev/null | wc -l) packages"
 
-      - name: Update database with repo-add
-        if: steps.diff.outputs.has_changes == 'true'
+      - name: Update and sign database
+        if: steps.check.outputs.needs_update == 'true'
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           cd /work
-          GPG_KEY_ID="8ED9ABE61CDBAABAC4B6A694C9218E60C13B4BA8"
-
-          # Remove repo-add backup files if any
           rm -f *.old
 
-          # repo-add updates both .db.tar.zst and .files.tar.zst
-          repo-add shorin-arch.db.tar.zst /tmp/newpkgs/*.pkg.tar.zst
+          # If no changed packages but sig was bad, we still need to re-sign
+          # In that case there are no packages to repo-add, just re-sign existing db
+          if ls /tmp/newpkgs/*.pkg.tar.zst >/dev/null 2>&1; then
+            repo-add shorin-arch.db.tar.zst /tmp/newpkgs/*.pkg.tar.zst
+          else
+            echo "No new packages to add, just re-signing existing database"
+          fi
 
-          # Sign database files manually (repo-add --sign is unreliable in CI)
+          # Sign database files
           gpg --batch --yes --pinentry-mode loopback \
             --passphrase "$GPG_PASSPHRASE" \
             --detach-sign --no-armor shorin-arch.db.tar.zst
@@ -205,12 +224,14 @@ jobs:
             --passphrase "$GPG_PASSPHRASE" \
             --detach-sign --no-armor shorin-arch.files.tar.zst
 
-          # Create no-suffix copies (pacman looks for shorin-arch.db etc.)
+          # Create no-suffix copies
           for f in shorin-arch.db shorin-arch.files; do
             if [ -L "$f" ]; then
               target=$(readlink -f "$f")
               rm -f "$f"
               cp "$target" "$f"
+            elif [ ! -f "$f" ]; then
+              cp "${f}.tar.zst" "$f"
             fi
           done
           for f in shorin-arch.db.sig shorin-arch.files.sig; do
@@ -218,18 +239,21 @@ jobs:
               target=$(readlink -f "$f")
               rm -f "$f"
               cp "$target" "$f"
+            elif [ ! -f "$f" ]; then
+              cp "${f%.sig}.tar.zst.sig" "$f" 2>/dev/null || true
             fi
           done
 
-          # Verify signatures locally before uploading
+          # Verify signatures before uploading
+          echo "Verifying db.tar.zst signature..."
           gpg --verify shorin-arch.db.tar.zst.sig shorin-arch.db.tar.zst
+          echo "Verifying files.tar.zst signature..."
           gpg --verify shorin-arch.files.tar.zst.sig shorin-arch.files.tar.zst
 
-          # Remove .old backups
           rm -f *.old
 
-      - name: Upload updated database to R2
-        if: steps.diff.outputs.has_changes == 'true'
+      - name: Upload database to R2
+        if: steps.check.outputs.needs_update == 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
