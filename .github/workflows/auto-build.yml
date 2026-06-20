@@ -133,13 +133,23 @@ jobs:
 
           > /work/build-results.txt
 
+          # Track processed PackageBases to avoid duplicate clone+build
+          declare -A PROCESSED_BASE
+
           while read -r aur_name aur_ver aur_base; do
             [ -z "$aur_name" ] && continue
 
             echo ""
             echo "============================================"
-            echo "Processing: $aur_name"
+            echo "Processing: $aur_name (ver=$aur_ver base=$aur_base)"
             echo "============================================"
+
+            # Skip if this PackageBase was already built
+            if [ -n "${PROCESSED_BASE[$aur_base]:-}" ]; then
+              echo "  SKIP: PackageBase '$aur_base' already built"
+              echo "SKIPPED $aur_name (base already built)" >> /work/build-results.txt
+              continue
+            fi
 
             db_ver="${DB_VER[$aur_name]:-}"
 
@@ -236,6 +246,9 @@ jobs:
               continue
             fi
 
+            # Mark this PackageBase as processed
+            PROCESSED_BASE["$aur_base"]=1
+
             # Find built packages
             for pkgfile in *.pkg.tar.zst; do
               [ -f "$pkgfile" ] || continue
@@ -287,8 +300,13 @@ jobs:
             cd /work
             rm -rf "$actual_dir"
 
-            # Clean up build dependencies to avoid conflicts between packages
-            sudo pacman -Rns $(pacman -Qdtq) 2>/dev/null || true
+            # Remove conflicting nvidia packages to avoid 470xx/580xx clashes
+            sudo pacman -Rns --noconfirm \
+              nvidia-470xx-utils nvidia-580xx-utils \
+              opencl-nvidia-470xx opencl-nvidia-580xx \
+              nvidia-470xx-settings nvidia-580xx-settings \
+              libxnvctrl-470xx libxnvctrl-580xx \
+              nvidia-470xx-dkms nvidia-580xx-dkms 2>/dev/null || true
 
           done < /work/aur-versions.txt
 
