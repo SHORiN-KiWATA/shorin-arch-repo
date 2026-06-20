@@ -42,11 +42,19 @@ jobs:
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
+          export GNUPGHOME=/root/.gnupg
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
-          echo "pinentry-mode loopback" > ~/.gnupg/gpg-agent.conf
-          echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+          echo "pinentry-mode loopback" > "$GNUPGHOME/gpg-agent.conf"
+          echo "allow-loopback-pinentry" >> "$GNUPGHOME/gpg-agent.conf"
+          # Kill any existing agent and prevent auto-start issues
           gpgconf --kill gpg-agent 2>/dev/null || true
-          gpgconf --launch gpg-agent 2>/dev/null || true
+          # Test signing works
+          echo "test" | gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "$GPG_PASSPHRASE" --detach-sign --no-armor 2>/dev/null \
+            && echo "GPG signing test OK" \
+            || echo "GPG signing test FAILED"
 
       - name: Download R2 database and parse versions
         shell: bash
@@ -113,6 +121,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          GNUPGHOME: /root/.gnupg
         run: |
           set +e
 
@@ -247,9 +256,13 @@ jobs:
               cp "$pkgfile" "/release/${pkgfile}"
 
               # Sign the package
-              gpg --batch --yes --pinentry-mode loopback \
+              if ! gpg --batch --yes --pinentry-mode loopback \
                 --passphrase "$GPG_PASSPHRASE" \
-                --detach-sign --no-armor "/release/${pkgfile}"
+                --detach-sign --no-armor "/release/${pkgfile}" 2>&1; then
+                echo "  FAILED: GPG signing failed for $pkgfile, skipping upload"
+                echo "FAILED $built_pkgname (signing error)" >> /work/build-results.txt
+                continue
+              fi
 
               echo "  Built and signed: $pkgfile (version: $BUILT_VER)"
 
