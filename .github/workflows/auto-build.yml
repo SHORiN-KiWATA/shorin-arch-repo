@@ -19,13 +19,24 @@ jobs:
         shell: bash
         run: |
           pacman -Syu --noconfirm
-          pacman -S --noconfirm aws-cli sudo git jq
+          pacman -S --noconfirm aws-cli sudo git jq go
           useradd -m builder
           mkdir -p /etc/sudoers.d
           echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
           chmod 440 /etc/sudoers.d/builder
           mkdir -p /work /release
           chown -R builder:builder /work /release
+
+          # Install yay from AUR
+          cd /tmp
+          git clone https://aur.archlinux.org/yay.git
+          cd yay
+          makepkg -si --noconfirm --needed
+          cd /
+          rm -rf /tmp/yay
+
+          # Configure yay for non-interactive use
+          sudo -u builder yay --save --answerclean All --answerdiff None --answeredit None --noeditmenu --nodiffmenu 2>/dev/null || true
 
       - name: Configure GPG
         shell: bash
@@ -96,125 +107,7 @@ jobs:
           echo "AUR versions:"
           cat /work/aur-versions.txt
 
-      - name: Detect packages needing rebuild
-        shell: bash
-        run: |
-          set +e
-
-          # Build db version lookup
-          declare -A DB_VER
-          while read -r name ver; do
-            [ -n "$name" ] && DB_VER["$name"]="$ver"
-          done < /work/db-versions.txt
-
-          > /work/rebuild-list.txt
-
-          while read -r aur_name aur_ver aur_base; do
-            [ -z "$aur_name" ] && continue
-
-            db_ver="${DB_VER[$aur_name]:-}"
-
-            if [ -z "$db_ver" ]; then
-              echo "NEW (not in db): $aur_name $aur_ver"
-              echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
-              continue
-            fi
-
-            if [[ "$aur_name" == *-git ]]; then
-              echo "Checking -git package: $aur_name (AUR RPC: $aur_ver, DB: $db_ver)"
-
-              check_dir="/work/check/${aur_name}"
-              rm -rf "$check_dir"
-              mkdir -p /work/check
-              chown -R builder:builder /work/check
-
-              if ! sudo -u builder git clone --quiet "https://aur.archlinux.org/${aur_base}.git" "$check_dir" 2>/dev/null; then
-                echo "  ERROR: Failed to clone AUR repo for $aur_name, skipping"
-                continue
-              fi
-
-              cd "$check_dir"
-
-              # makepkg -o: download sources only (nobuild)
-              # -s: install makedepends automatically (needed for prepare() 
-              #     which may call cargo/rustc/etc)
-              sudo -u builder makepkg -o -s --noconfirm --needed -C > /tmp/makepkg-o.log 2>&1
-              mp_rc=$?
-
-              if [ $mp_rc -ne 0 ]; then
-                echo "  makepkg -o failed (rc=$mp_rc):"
-                tail -5 /tmp/makepkg-o.log | sed 's/^/    /'
-                echo "  Marking for full build to check"
-                echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
-                cd /work
-                rm -rf "$check_dir"
-                continue
-              fi
-
-              srcdir="${check_dir}/src"
-
-              # Run pkgver() with proper env
-              computed_ver=$(sudo -u builder \
-                srcdir="$srcdir" \
-                startdir="$check_dir" \
-                bash -c '
-                  source PKGBUILD 2>/dev/null
-                  cd "$srcdir" 2>/dev/null
-                  pkgver 2>/dev/null
-                ' 2>/dev/null)
-
-              if [ -z "$computed_ver" ]; then
-                echo "  pkgver() failed, trying in startdir..."
-                computed_ver=$(sudo -u builder \
-                  srcdir="$srcdir" \
-                  startdir="$check_dir" \
-                  bash -c '
-                    source PKGBUILD 2>/dev/null
-                    pkgver 2>/dev/null
-                  ' 2>/dev/null)
-              fi
-
-              if [ -z "$computed_ver" ]; then
-                echo "  Could not compute pkgver, marking for full build"
-                echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
-                cd /work
-                rm -rf "$check_dir"
-                continue
-              fi
-
-              pkgrel=$(bash -c 'source PKGBUILD 2>/dev/null; echo "$pkgrel"' 2>/dev/null)
-              [ -z "$pkgrel" ] && pkgrel="1"
-
-              full_ver="${computed_ver}-${pkgrel}"
-              echo "  Computed: $full_ver (DB: $db_ver)"
-
-              if [ "$(vercmp "$full_ver" "$db_ver")" -gt 0 ]; then
-                echo "  NEEDS REBUILD"
-                echo "$aur_name $aur_base $full_ver" >> /work/rebuild-list.txt
-              else
-                echo "  UP TO DATE"
-              fi
-
-              cd /work
-              rm -rf "$check_dir"
-            else
-              if [ "$(vercmp "$aur_ver" "$db_ver")" -gt 0 ]; then
-                echo "UPDATE: $aur_name $db_ver -> $aur_ver"
-                echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
-              else
-                echo "UP TO DATE: $aur_name"
-              fi
-            fi
-          done < /work/aur-versions.txt
-
-          REBUILD_COUNT=$(wc -l < /work/rebuild-list.txt)
-          echo ""
-          echo "=== Summary ==="
-          echo "Packages needing rebuild: $REBUILD_COUNT"
-          cat /work/rebuild-list.txt
-
-      - name: Build, sign, and upload packages
-        if: hashFiles('/work/rebuild-list.txt') != '' && !cancelled()
+      - name: Detect and build packages
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -222,70 +115,134 @@ jobs:
           AWS_DEFAULT_REGION: auto
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
+          set +e
+
           ENDPOINT="--endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com"
           BUCKET="s3://shorin-arch-repo/archlinux/x86_64"
           R2_PREFIX="${BUCKET}/"
 
-          > /work/build-results.txt
-
-          # Skip if rebuild-list is empty
-          if [ ! -s /work/rebuild-list.txt ]; then
-            echo "No packages to build."
-            exit 0
-          fi
-
-          # Rebuild DB_VER lookup for post-build version check
+          # Build db version lookup
           declare -A DB_VER
           while read -r name ver; do
             [ -n "$name" ] && DB_VER["$name"]="$ver"
           done < /work/db-versions.txt
 
-          while read -r pkg_name pkg_base pkg_ver; do
-            [ -z "$pkg_name" ] && continue
+          > /work/build-results.txt
+
+          while read -r aur_name aur_ver aur_base; do
+            [ -z "$aur_name" ] && continue
 
             echo ""
             echo "============================================"
-            echo "Building: $pkg_name (base: $pkg_base)"
+            echo "Processing: $aur_name"
             echo "============================================"
 
-            build_dir="/work/build/${pkg_name}"
-            rm -rf "$build_dir"
-            mkdir -p "$build_dir"
-            chown builder:builder "$build_dir"
+            db_ver="${DB_VER[$aur_name]:-}"
 
-            # Clone AUR repo
-            if ! sudo -u builder git clone --quiet "https://aur.archlinux.org/${pkg_base}.git" "$build_dir"; then
-              echo "FAILED: Could not clone $pkg_base"
-              echo "FAILED $pkg_name (clone error)" >> /work/build-results.txt
+            if [ -z "$db_ver" ]; then
+              echo "  NEW (not in db)"
+            fi
+
+            pkg_dir="/work/build/${aur_name}"
+            rm -rf "$pkg_dir"
+            mkdir -p /work/build
+            chown -R builder:builder /work/build
+
+            # Clone AUR repo (single clone, reused for detect + build)
+            if ! sudo -u builder yay -G -a "$aur_base" --builddir /work/build 2>&1; then
+              echo "  FAILED: Could not clone $aur_base"
+              echo "FAILED $aur_name (clone error)" >> /work/build-results.txt
               continue
             fi
 
-            # Build
-            cd "$build_dir"
-            if ! sudo -u builder makepkg -s --noconfirm --skippgpcheck 2>&1; then
-              echo "FAILED: makepkg failed for $pkg_name"
-              echo "FAILED $pkg_name (makepkg error)" >> /work/build-results.txt
+            # yay -G creates a subdirectory named after PackageBase
+            actual_dir="/work/build/${aur_base}"
+            if [ ! -d "$actual_dir" ]; then
+              # Try aur_name if different from aur_base
+              actual_dir=$(find /work/build -maxdepth 1 -type d | tail -1)
+            fi
+
+            cd "$actual_dir"
+
+            if [[ "$aur_name" == *-git ]]; then
+              # For -git packages: run makepkg -o to get actual version from pkgver()
+              # yay -B with --mflags "-o" does: install deps + makepkg -o (nobuild)
+              echo "  Checking version via makepkg -o..."
+              sudo -u builder yay -B "$actual_dir" --noconfirm --mflags "-o" --answerclean All --answerdiff None 2>&1 | tail -5
+
+              # Get computed version from packagelist
+              pkglist_output=$(sudo -u builder makepkg --packagelist 2>/dev/null)
+              first_pkg=$(echo "$pkglist_output" | head -1)
+
+              if [ -z "$first_pkg" ]; then
+                echo "  ERROR: Could not get package list, marking for full build"
+                computed_ver=""
+              else
+                # Extract version from filename: <name>-<ver>-<rel>-<arch>.pkg.tar.zst
+                base_name=$(basename "$first_pkg" .pkg.tar.zst)
+                # Strip arch (last dash field)
+                tmp="${base_name%-*}"
+                # Strip rel (second to last dash field)
+                tmp="${tmp%-*}"
+                # Now tmp = <name>-<version>, version is after last dash
+                computed_ver="${tmp##*-}"
+
+                # Get pkgrel
+                pkgrel=$(bash -c 'source PKGBUILD 2>/dev/null; echo "$pkgrel"' 2>/dev/null)
+                [ -z "$pkgrel" ] && pkgrel="1"
+                full_ver="${computed_ver}-${pkgrel}"
+              fi
+
+              if [ -n "$full_ver" ]; then
+                echo "  Computed: $full_ver (DB: $db_ver)"
+                if [ -n "$db_ver" ] && [ "$(vercmp "$full_ver" "$db_ver")" -le 0 ]; then
+                  echo "  UP TO DATE"
+                  cd /work
+                  rm -rf "$actual_dir"
+                  echo "SKIPPED $aur_name (up to date: $full_ver)" >> /work/build-results.txt
+                  continue
+                fi
+                echo "  NEEDS REBUILD"
+              fi
+            else
+              # Non-git package: use RPC version directly
+              if [ -n "$db_ver" ] && [ "$(vercmp "$aur_ver" "$db_ver")" -le 0 ]; then
+                echo "  UP TO DATE: $aur_name"
+                cd /work
+                rm -rf "$actual_dir"
+                echo "SKIPPED $aur_name (up to date: $aur_ver)" >> /work/build-results.txt
+                continue
+              fi
+              echo "  NEEDS REBUILD: $aur_name $db_ver -> $aur_ver"
+            fi
+
+            # === Build phase (reuse same directory) ===
+            echo "  Building..."
+            if ! sudo -u builder yay -B "$actual_dir" --noconfirm --mflags "--skippgpcheck" --answerclean All --answerdiff None 2>&1 | tail -10; then
+              echo "  FAILED: Build failed for $aur_name"
+              echo "FAILED $aur_name (build error)" >> /work/build-results.txt
               cd /work
+              rm -rf "$actual_dir"
               continue
             fi
 
-            # Find and move built packages
+            # Find built packages
             for pkgfile in *.pkg.tar.zst; do
               [ -f "$pkgfile" ] || continue
 
-              # Extract built package version and compare with DB
+              # Extract version and compare with DB
               BASE_NAME=$(echo "$pkgfile" | sed -E 's/-[^-]+-[^-]+-[^-]+\.pkg\.tar\.zst$//')
               BUILT_VER=$(echo "$pkgfile" | sed -E 's/^.*-([^-]+-[^-]+)-[^-]+\.pkg\.tar\.zst$/\1/')
-              db_ver="${DB_VER[$pkg_name]:-}"
+              built_pkgname=$(echo "$pkgfile" | sed -E 's/-[^-]+-[^-]+-[^-]+\.pkg\.tar\.zst$//')
+              built_db_ver="${DB_VER[$built_pkgname]:-}"
 
-              if [ -n "$db_ver" ]; then
-                if [ "$(vercmp "$BUILT_VER" "$db_ver")" -le 0 ]; then
-                  echo "SKIP: $pkgfile version $BUILT_VER <= DB version $db_ver, not uploading"
-                  echo "SKIPPED $pkg_name (built $BUILT_VER <= db $db_ver)" >> /work/build-results.txt
-                  continue
-                fi
+              if [ -n "$built_db_ver" ] && [ "$(vercmp "$BUILT_VER" "$built_db_ver")" -le 0 ]; then
+                echo "  SKIP: $pkgfile ($BUILT_VER <= db $built_db_ver)"
+                echo "SKIPPED $built_pkgname (built $BUILT_VER <= db $built_db_ver)" >> /work/build-results.txt
+                continue
               fi
 
+              # Copy to release dir
               cp "$pkgfile" "/release/${pkgfile}"
 
               # Sign the package
@@ -293,14 +250,14 @@ jobs:
                 --passphrase "$GPG_PASSPHRASE" \
                 --detach-sign --no-armor "/release/${pkgfile}"
 
-              echo "Built and signed: $pkgfile (version: $BUILT_VER)"
+              echo "  Built and signed: $pkgfile (version: $BUILT_VER)"
 
               # Remove old versions on R2
               for R2_OBJ in $(aws s3 ls ${R2_PREFIX} ${ENDPOINT} | awk '{print $4}' | grep "\.pkg\.tar\.zst$"); do
                 [ "$R2_OBJ" = "$pkgfile" ] && continue
                 R2_BASE=$(echo "$R2_OBJ" | sed -E 's/-[^-]+-[^-]+-[^-]+\.pkg\.tar\.zst$//')
                 [ "$R2_BASE" = "$BASE_NAME" ] || continue
-                echo "Removing old: $R2_OBJ"
+                echo "  Removing old: $R2_OBJ"
                 aws s3 rm "${R2_PREFIX}${R2_OBJ}" ${ENDPOINT}
                 aws s3 rm "${R2_PREFIX}${R2_OBJ}.sig" ${ENDPOINT} 2>/dev/null || true
               done
@@ -309,14 +266,14 @@ jobs:
               aws s3 cp "/release/${pkgfile}" "${R2_PREFIX}${pkgfile}" ${ENDPOINT}
               aws s3 cp "/release/${pkgfile}.sig" "${R2_PREFIX}${pkgfile}.sig" ${ENDPOINT}
 
-              echo "Uploaded: $pkgfile + sig"
-              echo "OK $pkg_name ($pkgfile)" >> /work/build-results.txt
+              echo "  Uploaded: $pkgfile + sig"
+              echo "OK $built_pkgname ($pkgfile)" >> /work/build-results.txt
             done
 
             cd /work
-            rm -rf "$build_dir"
+            rm -rf "$actual_dir"
 
-          done < /work/rebuild-list.txt
+          done < /work/aur-versions.txt
 
           echo ""
           echo "=== Build Results ==="
@@ -329,20 +286,14 @@ jobs:
           echo "## Auto Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          if [ -f /work/rebuild-list.txt ] && [ -s /work/rebuild-list.txt ]; then
-            REBUILD_COUNT=$(wc -l < /work/rebuild-list.txt)
-            echo "**Packages checked for rebuild:** ${REBUILD_COUNT}" >> $GITHUB_STEP_SUMMARY
+          if [ -f /work/build-results.txt ] && [ -s /work/build-results.txt ]; then
+            echo "### Results" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-
-            if [ -f /work/build-results.txt ] && [ -s /work/build-results.txt ]; then
-              echo "### Results" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "| Package | Status |" >> $GITHUB_STEP_SUMMARY
-              echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
-              while read -r line; do
-                echo "| ${line} |" >> $GITHUB_STEP_SUMMARY
-              done < /work/build-results.txt
-            fi
+            echo "| Package | Status |" >> $GITHUB_STEP_SUMMARY
+            echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+            while read -r line; do
+              echo "| ${line} |" >> $GITHUB_STEP_SUMMARY
+            done < /work/build-results.txt
           else
             echo "**All packages up to date.**" >> $GITHUB_STEP_SUMMARY
           fi
