@@ -121,11 +121,13 @@ jobs:
             if [[ "$aur_name" == *-git ]]; then
               echo "Checking -git package: $aur_name (AUR RPC: $aur_ver, DB: $db_ver)"
 
-              check_dir="/tmp/check/${aur_name}"
+              check_dir="/work/check/${aur_name}"
               rm -rf "$check_dir"
-              mkdir -p /tmp/check
+              mkdir -p /work/check
+              chown -R builder:builder /work/check
 
-              if ! git clone --quiet "https://aur.archlinux.org/${aur_base}.git" "$check_dir" 2>/dev/null; then
+              # Clone as builder so makepkg has write permission
+              if ! sudo -u builder git clone --quiet "https://aur.archlinux.org/${aur_base}.git" "$check_dir" 2>/dev/null; then
                 echo "  ERROR: Failed to clone AUR repo for $aur_name, skipping"
                 continue
               fi
@@ -133,49 +135,57 @@ jobs:
               cd "$check_dir"
 
               # makepkg -od: download sources only, no build.
-              # Use --nodeps to avoid needing all makedepends installed just for version check.
-              if ! sudo -u builder makepkg -od --noconfirm --nodeps 2>&1; then
-                echo "  ERROR: makepkg -od failed for $aur_name, trying with RPC version"
-                # Fall back: try vercmp with the AUR RPC version
-                if [ "$(vercmp "$aur_ver" "$db_ver")" -gt 0 ]; then
-                  echo "  NEEDS REBUILD (RPC): $aur_name $db_ver -> $aur_ver"
-                  echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
-                else
-                  echo "  UP TO DATE: $aur_name"
-                fi
+              # --nodeps: skip makedepends check (we only need sources for pkgver)
+              # -C: clean leftover build artifacts first
+              makepkg_od_output=$(sudo -u builder makepkg -od --noconfirm --nodeps -C 2>&1)
+              makepkg_od_rc=$?
+
+              if [ $makepkg_od_rc -ne 0 ]; then
+                echo "  makepkg -od output:"
+                echo "$makepkg_od_output"
+                echo "  ERROR: makepkg -od failed for $aur_name"
+                echo "  Will attempt full build to check (makepkg -s will get actual version)"
+                # If makepkg -od fails, we can't compute pkgver without building.
+                # Mark for rebuild - the build step will run makepkg -s which
+                # computes pkgver internally. If the resulting package version
+                # is not newer, it just wastes a build but won't break anything.
+                echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
                 cd /work
                 rm -rf "$check_dir"
                 continue
               fi
 
-              # Source PKGBUILD and run pkgver() in the srcdir context
-              # makepkg -od sets srcdir in $PWD/src
-              computed_ver=$(sudo -u builder bash -c '
-                set +e
-                source PKGBUILD 2>/dev/null
-                if [ -d "$srcdir" ]; then
-                  cd "$srcdir"
-                fi
-                pkgver 2>/dev/null
-              ' 2>/dev/null)
+              # Get srcdir (makepkg uses $startdir/src by default)
+              srcdir="${check_dir}/src"
 
-              if [ -z "$computed_ver" ]; then
-                echo "  pkgver() failed, trying alternative approach..."
-                computed_ver=$(sudo -u builder bash -c '
+              # Source PKGBUILD and run pkgver() in the srcdir context
+              # We need to pass srcdir and startdir as environment variables
+              computed_ver=$(sudo -u builder \
+                srcdir="$srcdir" \
+                startdir="$check_dir" \
+                bash -c '
                   set +e
                   source PKGBUILD 2>/dev/null
+                  cd "$srcdir" 2>/dev/null
                   pkgver 2>/dev/null
                 ' 2>/dev/null)
+
+              if [ -z "$computed_ver" ]; then
+                echo "  pkgver() in srcdir failed, trying in startdir..."
+                computed_ver=$(sudo -u builder \
+                  srcdir="$srcdir" \
+                  startdir="$check_dir" \
+                  bash -c '
+                    set +e
+                    source PKGBUILD 2>/dev/null
+                    pkgver 2>/dev/null
+                  ' 2>/dev/null)
               fi
 
               if [ -z "$computed_ver" ]; then
                 echo "  ERROR: Could not compute pkgver for $aur_name"
-                # Fall back to RPC version
-                if [ "$(vercmp "$aur_ver" "$db_ver")" -gt 0 ]; then
-                  echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
-                else
-                  echo "  UP TO DATE: $aur_name"
-                fi
+                echo "  Will attempt full build to check"
+                echo "$aur_name $aur_base $aur_ver" >> /work/rebuild-list.txt
                 cd /work
                 rm -rf "$check_dir"
                 continue
@@ -235,6 +245,12 @@ jobs:
             exit 0
           fi
 
+          # Rebuild DB_VER lookup for post-build version check
+          declare -A DB_VER
+          while read -r name ver; do
+            [ -n "$name" ] && DB_VER["$name"]="$ver"
+          done < /work/db-versions.txt
+
           while read -r pkg_name pkg_base pkg_ver; do
             [ -z "$pkg_name" ] && continue
 
@@ -267,6 +283,20 @@ jobs:
             # Find and move built packages
             for pkgfile in *.pkg.tar.zst; do
               [ -f "$pkgfile" ] || continue
+
+              # Extract built package version and compare with DB
+              BASE_NAME=$(echo "$pkgfile" | sed -E 's/-[^-]+-[^-]+-[^-]+\.pkg\.tar\.zst$//')
+              BUILT_VER=$(echo "$pkgfile" | sed -E 's/^.*-([^-]+-[^-]+)-[^-]+\.pkg\.tar\.zst$/\1/')
+              db_ver="${DB_VER[$pkg_name]:-}"
+
+              if [ -n "$db_ver" ]; then
+                if [ "$(vercmp "$BUILT_VER" "$db_ver")" -le 0 ]; then
+                  echo "SKIP: $pkgfile version $BUILT_VER <= DB version $db_ver, not uploading"
+                  echo "SKIPPED $pkg_name (built $BUILT_VER <= db $db_ver)" >> /work/build-results.txt
+                  continue
+                fi
+              fi
+
               cp "$pkgfile" "/release/${pkgfile}"
 
               # Sign the package
@@ -274,10 +304,7 @@ jobs:
                 --passphrase "$GPG_PASSPHRASE" \
                 --detach-sign --no-armor "/release/${pkgfile}"
 
-              echo "Built and signed: $pkgfile"
-
-              # Extract base name for cleanup
-              BASE_NAME=$(echo "$pkgfile" | sed -E 's/-[^-]+-[^-]+-[^-]+\.pkg\.tar\.zst$//')
+              echo "Built and signed: $pkgfile (version: $BUILT_VER)"
 
               # Remove old versions on R2
               for R2_OBJ in $(aws s3 ls ${R2_PREFIX} ${ENDPOINT} | awk '{print $4}' | grep "\.pkg\.tar\.zst$"); do
