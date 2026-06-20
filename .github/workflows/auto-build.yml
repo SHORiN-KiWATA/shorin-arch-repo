@@ -27,11 +27,10 @@ jobs:
           mkdir -p /work /release
           chown -R builder:builder /work /release
 
-          # Install yay from AUR
-          cd /tmp
-          git clone https://aur.archlinux.org/yay.git
-          cd yay
-          makepkg -si --noconfirm --needed
+          # Install yay from AUR (must run as non-root)
+          sudo -u builder git clone https://aur.archlinux.org/yay.git /tmp/yay
+          chown -R builder:builder /tmp/yay
+          sudo -u builder bash -c 'cd /tmp/yay && makepkg -si --noconfirm --needed'
           cd /
           rm -rf /tmp/yay
 
