@@ -39,10 +39,17 @@ python-desktop-entry-lib
 # === nvidia drivers ===
 nvidia-580xx-utils
 nvidia-580xx-dkms
+nvidia-580xx-settings
 opencl-nvidia-580xx
-nvidia-470xx-utils
+lib32-opencl-nvidia-580xx
+lib32-nvidia-580xx-utils
+
 nvidia-470xx-dkms
+nvidia-470xx-utils
+nvidia-470xx-settings 
 opencl-nvidia-470xx
+lib32-nvidia-470xx-utils
+lib32-opencl-nvidia-470xx
 
 # === cdn === 
 wechat-appimage
