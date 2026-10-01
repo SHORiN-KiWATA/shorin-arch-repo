@@ -3,7 +3,6 @@ cliphist-tui-git
 ddcutil-service
 dsearch-bin
 kwin-effects-geometry-change
-linuxqq-clipsync-git
 niri-sidebar-git
 nirius
 quickshell-git
@@ -60,4 +59,5 @@ fcitx5-shorin-patched-git
 yay
 paru
 linuxqq
+linuxqq-wayland-fix-git
 miyu
